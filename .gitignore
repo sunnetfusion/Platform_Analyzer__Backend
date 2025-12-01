@@ -1,0 +1,7 @@
+# .gitignore
+
+# Secrets/Config
+.env
+
+# Frontend files (if they are in a different directory)
+frontend/

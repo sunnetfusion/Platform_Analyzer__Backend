@@ -1,0 +1,11 @@
+cat > Backend/.env.example << 'EOF'
+# Groq AI (Get from: https://console.groq.com)
+GROQ_API_KEY=your_groq_api_key_here
+
+# Optional: Twitter API
+TWITTER_BEARER_TOKEN=your_twitter_token_here
+
+# Server Configuration
+PORT=8000
+ENV=production
+EOF
