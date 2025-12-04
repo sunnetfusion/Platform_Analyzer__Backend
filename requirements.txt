@@ -80,4 +80,5 @@ openai==1.12.0
 # celery==5.3.6
 # kombu==5.3.5
 gunicorn
+uvicorn
 # other packages below (e.g., flask, requests, etc.)
