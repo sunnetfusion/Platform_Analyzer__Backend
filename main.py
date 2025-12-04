@@ -15,7 +15,7 @@ app.add_middleware(
     CORSMiddleware,
     # ... rest of your CORS configuration
     allow_origins=[
-        "http://localhost:5173",
+        "https://platform-analyzer-frontend.vercel.app",
         "https://platform-analyzer-backend.onrender.com/api",
         "https://*.vercel.app", 
         # ... other origins
