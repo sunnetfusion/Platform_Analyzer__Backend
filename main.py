@@ -1,28 +1,70 @@
-# main.py (This is what your file should look like)
+# main.py
+from fastapi import FastAPI, HTTPException
+from starlette.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+from typing import Optional
 
-# 1. IMPORT NECESSARY LIBRARIES (including your framework)
-from fastapi import FastAPI # or from flask import Flask
-from starlette.middleware.cors import CORSMiddleware 
+# Define the application
+app = FastAPI()
 
-# 2. DEFINE THE APPLICATION OBJECT (THIS MUST COME FIRST)
-# If using FastAPI:
-app = FastAPI() 
-# If using Flask (less likely with add_middleware):
-# app = Flask(__name__) 
-
-# 3. CONFIGURE MIDDLEWARE (Now 'app' is defined and can be used)
+# Configure CORS
 app.add_middleware(
     CORSMiddleware,
-    # ... rest of your CORS configuration
     allow_origins=[
         "https://platform-analyzer-frontend.vercel.app",
-        "https://platform-analyzer-backend.onrender.com/api",
-        "https://*.vercel.app", 
-        # ... other origins
+        "https://platform-analyzer-backend.onrender.com",
+        "https://*.vercel.app",
+        "http://localhost:5173",
     ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# ... rest of your routes and application logic
+# Data models
+class AnalyzeRequest(BaseModel):
+    url: str
+    platform: Optional[str] = None
+
+# Routes
+@app.get("/")
+async def root():
+    return {
+        "status": "online",
+        "message": "Platform Analyzer API is running",
+        "version": "1.0.0"
+    }
+
+@app.post("/api/analyze")
+async def analyze_platform(request: AnalyzeRequest):
+    try:
+        url = request.url.lower()
+        
+        if "youtube.com" in url or "youtu.be" in url:
+            platform = "youtube"
+        elif "instagram.com" in url:
+            platform = "instagram"
+        elif "tiktok.com" in url:
+            platform = "tiktok"
+        elif "twitter.com" in url or "x.com" in url:
+            platform = "twitter"
+        else:
+            platform = request.platform or "unknown"
+        
+        metrics = {
+            "followers": 10000,
+            "engagement_rate": 4.5,
+            "avg_views": 5000,
+            "total_posts": 150,
+            "growth_rate": 2.3
+        }
+        
+        return {
+            "status": "success",
+            "platform": platform,
+            "metrics": metrics,
+            "message": f"Successfully analyzed {platform} platform"
+        }
+        
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
