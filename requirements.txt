@@ -1,55 +1,18 @@
-# ============================================
 # Core FastAPI & Server
-# ============================================
 fastapi>=0.115.0
 uvicorn[standard]>=0.32.0
 gunicorn>=23.0.0
 pydantic>=2.10.0
 python-multipart==0.0.9
 
-# ============================================
-# HTTP & Web Scraping
-# ============================================
-requests==2.31.0
-httpx==0.26.0
-aiohttp==3.9.3
-beautifulsoup4==4.12.3
-lxml==5.1.0
-
-# ============================================
-# WHOIS & Domain Analysis
-# ============================================
-python-whois==0.8.0
-whois==0.9.27
-dnspython==2.4.2
+# Real Analysis Features
+python-whois>=0.9.4
+python-dateutil>=2.8.2
 requests>=2.31.0
-
-# ============================================
-# Security & Encryption
-# ============================================
-cryptography>=42.0.0
-
-# ============================================
-# NLP & Text Analysis
-# ============================================
-textblob==0.17.1
-nltk==3.8.1
-
-# ============================================
-# Image Analysis
-# ============================================
-Pillow>=10.3.0
-imagehash==4.3.1
-
-# ============================================
-# Utilities
-# ============================================
-python-dotenv==1.0.0
-python-dateutil==2.8.2
-
-# Twitter/X API Integration
-tweepy==4.14.0
+beautifulsoup4>=4.12.0
+lxml>=4.9.0
 
 # AI Analysis
 groq>=0.4.0
-
+# Twitter/X API Integration
+tweepy==4.14.0
