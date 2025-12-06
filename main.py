@@ -32,6 +32,14 @@ class AnalyzeRequest(BaseModel):
     url: str
     platform: Optional[str] = None
 
+class CommentRequest(BaseModel):
+    url: str
+    user_name: str
+    rating: int  # 1-5 stars
+    experience: str  # positive, neutral, negative
+    comment: str
+    was_scammed: bool = False
+
 def get_domain_age(url):
     """Get domain registration date and calculate age"""
     try:
@@ -146,56 +154,84 @@ def analyze_content(url):
 
 def calculate_trust_score(domain_info, ssl_info, content_info):
     """Calculate trust score based on various factors"""
-    score = 50  # Start at neutral
+    score = 60  # Start at 60 (neutral to positive) instead of 50
     findings = []
     
-    # Domain age scoring
+    # Domain age scoring (more generous)
     age_days = domain_info.get("age_days", 0)
-    if age_days > 365 * 2:  # Over 2 years
-        score += 20
+    if age_days > 365 * 5:  # Over 5 years
+        score += 25
+        findings.append({"type": "info", "text": f"Domain is {domain_info['age']} old - Very established"})
+    elif age_days > 365 * 2:  # 2-5 years
+        score += 15
         findings.append({"type": "info", "text": f"Domain is {domain_info['age']} old - Established presence"})
-    elif age_days > 180:  # 6 months to 2 years
-        score += 10
-        findings.append({"type": "warning", "text": f"Domain is relatively new ({domain_info['age']})"})
-    else:  # Less than 6 months
-        score -= 15
-        findings.append({"type": "critical", "text": f"Very new domain ({domain_info['age']}) - High risk"})
-    
-    # SSL scoring
-    if ssl_info["valid"]:
-        score += 10
-        findings.append({"type": "info", "text": "Valid SSL certificate found"})
-    else:
-        score -= 20
-        findings.append({"type": "critical", "text": "No valid SSL certificate - UNSAFE"})
-    
-    # Content scoring
-    if content_info["aboutUsFound"]:
+    elif age_days > 365:  # 1-2 years
         score += 5
-    else:
+        findings.append({"type": "info", "text": f"Domain is {domain_info['age']} old - Moderately established"})
+    elif age_days > 180:  # 6 months to 1 year
+        score += 0  # Neutral - don't penalize
+        findings.append({"type": "warning", "text": f"Domain is relatively new ({domain_info['age']})"})
+    elif age_days > 90:  # 3-6 months
         score -= 5
-        findings.append({"type": "warning", "text": "No 'About Us' page found"})
+        findings.append({"type": "warning", "text": f"Domain is quite new ({domain_info['age']}) - Exercise caution"})
+    else:  # Less than 3 months
+        score -= 15
+        findings.append({"type": "critical", "text": f"Very new domain ({domain_info['age']}) - Higher risk"})
+    
+    # SSL scoring (critical for security)
+    if ssl_info["valid"]:
+        score += 15
+        findings.append({"type": "info", "text": "Valid SSL certificate found - Secure connection"})
+    else:
+        score -= 25
+        findings.append({"type": "critical", "text": "No valid SSL certificate - UNSAFE for sensitive data"})
+    
+    # Content scoring (more lenient - not all sites need all elements)
+    content_score = 0
+    
+    if content_info["aboutUsFound"]:
+        content_score += 3
+        findings.append({"type": "info", "text": "About page found - Transparent about identity"})
     
     if content_info["contactInfoFound"]:
-        score += 5
+        content_score += 5
+        findings.append({"type": "info", "text": "Contact information found - Reachable"})
     else:
-        score -= 5
-        findings.append({"type": "warning", "text": "No contact information found"})
+        # Only minor penalty, not all sites need public contact
+        findings.append({"type": "warning", "text": "No obvious contact information found"})
+    
+    if content_info["termsOfServiceFound"]:
+        content_score += 3
+        findings.append({"type": "info", "text": "Terms of Service found - Professional"})
     
     if content_info["physicalAddressFound"]:
-        score += 10
-        findings.append({"type": "info", "text": "Physical address found on website"})
-    else:
-        score -= 5
-        findings.append({"type": "warning", "text": "No physical address found"})
+        content_score += 8
+        findings.append({"type": "info", "text": "Physical address found - Legitimate business location"})
     
+    if content_info.get("phoneNumberFound"):
+        content_score += 5
+        findings.append({"type": "info", "text": "Phone number found - Direct contact available"})
+    
+    # Add content score to total
+    score += content_score
+    
+    # Stock images (only major penalty if many are detected)
     if content_info["stockImagesDetected"]:
-        score -= 10
-        findings.append({"type": "critical", "text": f"Stock images detected ({content_info['stockImageCount']} found)"})
+        stock_count = content_info.get("stockImageCount", 0)
+        if stock_count > 5:
+            score -= 15
+            findings.append({"type": "critical", "text": f"Many stock images detected ({stock_count}) - Potentially fake team"})
+        elif stock_count > 2:
+            score -= 8
+            findings.append({"type": "warning", "text": f"Stock images detected ({stock_count}) - Verify authenticity"})
+        else:
+            score -= 3
+            findings.append({"type": "warning", "text": "Some stock images detected"})
     
-    # Red flag keywords
+    # Red flag keywords (serious concern)
     if content_info["redFlagKeywords"]:
-        score -= len(content_info["redFlagKeywords"]) * 5
+        penalty = min(len(content_info["redFlagKeywords"]) * 8, 30)  # Cap at -30
+        score -= penalty
         findings.append({"type": "critical", "text": f"Scam keywords detected: {', '.join(content_info['redFlagKeywords'][:3])}"})
     
     # Ensure score is between 0 and 100
@@ -203,14 +239,42 @@ def calculate_trust_score(domain_info, ssl_info, content_info):
     
     return score, findings
 
-def get_verdict(score):
-    """Get verdict based on trust score"""
-    if score >= 70:
-        return "Legit"
-    elif score >= 40:
-        return "Caution"
-    else:
-        return "Scam"
+def detect_website_type(domain, page_content):
+    """Detect the type of website to apply appropriate analysis"""
+    domain_lower = domain.lower()
+    content_lower = page_content.lower()
+    
+    # Educational institutions
+    edu_indicators = ['.edu', 'university', 'college', 'school', 'academy', 'institute', 'education']
+    if any(ind in domain_lower for ind in edu_indicators) or any(ind in content_lower for ind in ['student', 'faculty', 'research', 'academic']):
+        return 'educational'
+    
+    # Government
+    gov_indicators = ['.gov', '.gov.', 'government', 'ministry', 'department']
+    if any(ind in domain_lower for ind in gov_indicators):
+        return 'government'
+    
+    # News/Media
+    news_indicators = ['news', 'press', 'media', 'journal', 'magazine', 'blog']
+    if any(ind in domain_lower for ind in news_indicators):
+        return 'media'
+    
+    # E-commerce
+    ecommerce_indicators = ['shop', 'store', 'cart', 'checkout', 'buy now', 'add to cart', 'product']
+    if any(ind in content_lower for ind in ecommerce_indicators):
+        return 'ecommerce'
+    
+    # Financial/Investment (needs more scrutiny)
+    financial_indicators = ['invest', 'trading', 'forex', 'crypto', 'profit', 'returns', 'portfolio']
+    if any(ind in content_lower for ind in financial_indicators):
+        return 'financial'
+    
+    # Non-profit/NGO
+    nonprofit_indicators = ['donate', 'charity', 'nonprofit', 'foundation', 'ngo', 'volunteer']
+    if any(ind in content_lower for ind in nonprofit_indicators):
+        return 'nonprofit'
+    
+    return 'general'
 
 def search_social_media(domain):
     """Search for mentions on social media and review sites"""
@@ -376,6 +440,92 @@ async def root():
         "version": "2.0.0"
     }
 
+# In-memory storage for comments (in production, use a database)
+comments_db = {}
+
+@app.post("/api/comments")
+async def add_comment(comment: CommentRequest):
+    """Add user comment/review for a website"""
+    try:
+        # Normalize URL
+        url = comment.url.lower().strip()
+        if not url.startswith(('http://', 'https://')):
+            url = 'https://' + url
+        
+        domain = urlparse(url).netloc.replace('www.', '')
+        
+        # Create comment entry
+        comment_entry = {
+            "id": len(comments_db.get(domain, [])) + 1,
+            "user_name": comment.user_name,
+            "rating": max(1, min(5, comment.rating)),  # Ensure 1-5
+            "experience": comment.experience,
+            "comment": comment.comment,
+            "was_scammed": comment.was_scammed,
+            "timestamp": datetime.now().isoformat(),
+            "helpful_count": 0
+        }
+        
+        # Store comment
+        if domain not in comments_db:
+            comments_db[domain] = []
+        comments_db[domain].append(comment_entry)
+        
+        return {
+            "status": "success",
+            "message": "Comment added successfully",
+            "comment": comment_entry
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/comments/{domain}")
+async def get_comments(domain: str):
+    """Get all comments for a domain"""
+    try:
+        domain = domain.lower().replace('www.', '')
+        comments = comments_db.get(domain, [])
+        
+        # Calculate statistics
+        total_comments = len(comments)
+        if total_comments > 0:
+            avg_rating = sum(c["rating"] for c in comments) / total_comments
+            scam_reports = sum(1 for c in comments if c["was_scammed"])
+            experience_breakdown = {
+                "positive": sum(1 for c in comments if c["experience"] == "positive"),
+                "neutral": sum(1 for c in comments if c["experience"] == "neutral"),
+                "negative": sum(1 for c in comments if c["experience"] == "negative")
+            }
+        else:
+            avg_rating = 0
+            scam_reports = 0
+            experience_breakdown = {"positive": 0, "neutral": 0, "negative": 0}
+        
+        return {
+            "domain": domain,
+            "total_comments": total_comments,
+            "average_rating": round(avg_rating, 1),
+            "scam_reports": scam_reports,
+            "experience_breakdown": experience_breakdown,
+            "comments": sorted(comments, key=lambda x: x["timestamp"], reverse=True)
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/api/comments/{comment_id}/helpful")
+async def mark_helpful(comment_id: int, domain: str):
+    """Mark a comment as helpful"""
+    try:
+        domain = domain.lower().replace('www.', '')
+        if domain in comments_db:
+            for comment in comments_db[domain]:
+                if comment["id"] == comment_id:
+                    comment["helpful_count"] += 1
+                    return {"status": "success", "helpful_count": comment["helpful_count"]}
+        raise HTTPException(status_code=404, detail="Comment not found")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
 @app.post("/api/analyze")
 async def analyze_platform(request: AnalyzeRequest):
     try:
@@ -475,6 +625,38 @@ async def analyze_platform(request: AnalyzeRequest):
         ssl_info = check_ssl(url)
         content_info = analyze_content(url)
         
+        # Get user comments for this domain
+        domain_clean = domain.replace('www.', '')
+        user_comments_data = comments_db.get(domain_clean, [])
+        user_comment_count = len(user_comments_data)
+        user_scam_reports = sum(1 for c in user_comments_data if c.get("was_scammed", False))
+        user_avg_rating = sum(c.get("rating", 0) for c in user_comments_data) / user_comment_count if user_comment_count > 0 else 0
+        
+        # Detect website type for context-aware analysis
+        website_type = detect_website_type(domain, content_info.get("pageContent", ""))
+        
+        # Calculate initial trust score
+        trust_score, findings = calculate_trust_score(domain_info, ssl_info, content_info)
+        
+        # Apply context-aware adjustments
+        trust_score, findings = adjust_score_by_website_type(trust_score, website_type, findings)
+        
+        # Adjust score based on user comments
+        if user_comment_count > 0:
+            if user_scam_reports > 3:
+                trust_score -= 20
+                findings.insert(0, {"type": "critical", "text": f"⚠️ {user_scam_reports} users reported being scammed!"})
+            elif user_scam_reports > 0:
+                trust_score -= 10
+                findings.insert(0, {"type": "warning", "text": f"{user_scam_reports} scam report(s) from users"})
+            
+            if user_avg_rating >= 4:
+                trust_score += 5
+                findings.insert(0, {"type": "info", "text": f"Users rate this site {user_avg_rating:.1f}/5 stars ({user_comment_count} reviews)"})
+            elif user_avg_rating <= 2:
+                trust_score -= 10
+                findings.insert(0, {"type": "warning", "text": f"Low user rating: {user_avg_rating:.1f}/5 stars ({user_comment_count} reviews)"})
+        
         # Social media and complaints
         social_data = search_social_media(domain)
         withdrawal_complaints = search_withdrawal_complaints(domain, content_info.get("pageContent", ""))
@@ -484,9 +666,6 @@ async def analyze_platform(request: AnalyzeRequest):
         
         # AI analysis with Groq
         ai_analysis = analyze_with_groq(domain, content_info.get("pageContent", ""), domain_info, ssl_info)
-        
-        # Calculate trust score
-        trust_score, findings = calculate_trust_score(domain_info, ssl_info, content_info)
         
         # Adjust score based on social signals
         if withdrawal_complaints > 5:
