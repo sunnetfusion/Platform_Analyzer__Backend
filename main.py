@@ -5,7 +5,7 @@ from pydantic import BaseModel
 from typing import Optional
 import ssl
 import socket
-import whois
+import python_whois as whois
 from datetime import datetime
 from urllib.parse import urlparse
 import requests
@@ -44,20 +44,25 @@ def get_domain_age(url):
     """Get domain registration date and calculate age"""
     try:
         domain = urlparse(url).netloc
-        w = whois.whois(domain)
+        w = whois.get_whois(domain)
         
-        creation_date = w.creation_date
+        creation_date = w.get('creation_date')
         if isinstance(creation_date, list):
             creation_date = creation_date[0]
         
         if creation_date:
+            if isinstance(creation_date, str):
+                # Parse string date
+                from dateutil import parser
+                creation_date = parser.parse(creation_date)
+            
             age_days = (datetime.now() - creation_date).days
             age_years = age_days / 365
             
             return {
                 "age": f"{age_years:.1f} years" if age_years >= 1 else f"{age_days} days",
                 "registered": creation_date.strftime("%Y-%m-%d"),
-                "registrar": w.registrar if w.registrar else "Unknown",
+                "registrar": w.get('registrar', 'Unknown'),
                 "age_days": age_days
             }
     except Exception as e:
