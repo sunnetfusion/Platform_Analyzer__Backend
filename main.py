@@ -5,14 +5,14 @@ from pydantic import BaseModel
 from typing import Optional
 import ssl
 import socket
-import python_whois as whois
+import whois
 from datetime import datetime
 from urllib.parse import urlparse
 import requests
 from bs4 import BeautifulSoup
 import re
 import os
-from groq import Groq
+from groq import roq
 
 app = FastAPI(title="Platform Analyzer API")
 
@@ -44,7 +44,7 @@ def get_domain_age(url):
     """Get domain registration date and calculate age"""
     try:
         domain = urlparse(url).netloc
-        w = whois.get_whois(domain)
+        w = w = whois.whois(domain)
         
         creation_date = w.get('creation_date')
         if isinstance(creation_date, list):
@@ -62,7 +62,7 @@ def get_domain_age(url):
             return {
                 "age": f"{age_years:.1f} years" if age_years >= 1 else f"{age_days} days",
                 "registered": creation_date.strftime("%Y-%m-%d"),
-                "registrar": w.get('registrar', 'Unknown'),
+                "registrar": w.registrar if hasattr(w, 'registrar') and w.registrar else "Unknown",
                 "age_days": age_days
             }
     except Exception as e:
