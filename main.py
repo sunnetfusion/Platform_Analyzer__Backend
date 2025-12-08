@@ -318,54 +318,7 @@ def calculate_trust_score(domain_info: Dict[str, Any], ssl_info: Dict[str, Any],
     score = max(0, min(100, score))
     
     return score, findings
-def analyze_with_groq(domain, page_content, domain_info, ssl_info):
-    """Use Groq AI to analyze the website content for scam indicators"""
-    try:
-        # Check if API key is available
-        api_key = os.getenv("GROQ_API_KEY")
-        if not api_key:
-            print("GROQ_API_KEY not set, skipping AI analysis")
-            return None
-        
-        client = Groq(api_key=api_key)
-        
-        prompt = f"""Analyze this website for legitimacy and scam indicators:
 
-Domain: {domain}
-Domain Age: {domain_info.get('age', 'Unknown')}
-SSL Certificate: {'Valid' if ssl_info.get('valid') else 'Invalid'}
-
-Website Content (first 2000 chars):
-{page_content}
-
-Provide a brief analysis covering:
-1. Overall legitimacy assessment (1-2 sentences)
-2. Top 3 red flags or concerns (if any)
-3. Top 3 positive indicators (if any)
-
-Keep response under 200 words."""
-
-        chat_completion = client.chat.completions.create(
-            messages=[
-                {
-                    "role": "system",
-                    "content": "You are a cybersecurity expert specializing in scam detection and website legitimacy analysis."
-                },
-                {
-                    "role": "user",
-                    "content": prompt
-                }
-            ],
-            model="llama-3.3-70b-versatile",
-            temperature=0.3,
-            max_tokens=300
-        )
-        
-        return chat_completion.choices[0].message.content
-    except Exception as e:
-        print(f"Groq analysis error: {e}")
-        return None
-        
 def detect_website_type(domain: str, page_content: str) -> str:
     """Detect the type of website to apply appropriate analysis"""
     domain_lower = domain.lower()
@@ -429,6 +382,203 @@ def get_verdict(score: int) -> str:
         return "Caution"
     else:
         return "Scam"
+
+def analyze_with_groq(domain: str, page_content: str, domain_info: Dict[str, Any], 
+                      ssl_info: Dict[str, Any]) -> Optional[str]:
+    """Use Groq AI to analyze the website content for scam indicators"""
+    try:
+        api_key = os.getenv("GROQ_API_KEY")
+        if not api_key:
+            print("GROQ_API_KEY not set, skipping AI analysis")
+            return None
+        
+        client = Groq(api_key=api_key)
+        
+        prompt = f"""Analyze this website for legitimacy and scam indicators:
+
+Domain: {domain}
+Domain Age: {domain_info.get('age', 'Unknown')}
+SSL Certificate: {'Valid' if ssl_info.get('valid') else 'Invalid'}
+
+Website Content (first 2000 chars):
+{page_content}
+
+Provide a brief analysis covering:
+1. Overall legitimacy assessment (1-2 sentences)
+2. Top 3 red flags or concerns (if any)
+3. Top 3 positive indicators (if any)
+
+Keep response under 200 words."""
+
+        chat_completion = client.chat.completions.create(
+            messages=[
+                {
+                    "role": "system",
+                    "content": "You are a cybersecurity expert specializing in scam detection and website legitimacy analysis."
+                },
+                {
+                    "role": "user",
+                    "content": prompt
+                }
+            ],
+            model="llama-3.3-70b-versatile",
+            temperature=0.3,
+            max_tokens=300
+        )
+        
+        return chat_completion.choices[0].message.content
+    except Exception as e:
+        print(f"Groq analysis error: {e}")
+        return None
+
+def check_google_safe_browsing(url: str) -> Dict[str, Any]:
+    """Check URL against Google Safe Browsing API for malware/phishing"""
+    try:
+        api_key = os.getenv("GOOGLE_SAFE_BROWSING_API_KEY")
+        if not api_key:
+            print("GOOGLE_SAFE_BROWSING_API_KEY not set, skipping malware check")
+            return {
+                "is_safe": True,
+                "threats": [],
+                "threat_types": [],
+                "checked": False
+            }
+        
+        api_url = f"https://safebrowsing.googleapis.com/v4/threatMatches:find?key={api_key}"
+        
+        payload = {
+            "client": {
+                "clientId": "platform-analyzer",
+                "clientVersion": "1.0.0"
+            },
+            "threatInfo": {
+                "threatTypes": [
+                    "MALWARE",
+                    "SOCIAL_ENGINEERING",
+                    "UNWANTED_SOFTWARE",
+                    "POTENTIALLY_HARMFUL_APPLICATION"
+                ],
+                "platformTypes": ["ANY_PLATFORM"],
+                "threatEntryTypes": ["URL"],
+                "threatEntries": [{"url": url}]
+            }
+        }
+        
+        response = requests.post(api_url, json=payload, timeout=5)
+        
+        if response.status_code == 200:
+            data = response.json()
+            
+            if "matches" in data and len(data["matches"]) > 0:
+                threats = []
+                threat_types = []
+                
+                for match in data["matches"]:
+                    threat_type = match.get("threatType", "UNKNOWN")
+                    threat_types.append(threat_type)
+                    
+                    if threat_type == "MALWARE":
+                        threats.append("⚠️ MALWARE DETECTED - Site distributes malicious software")
+                    elif threat_type == "SOCIAL_ENGINEERING":
+                        threats.append("⚠️ PHISHING DETECTED - Site attempts to steal personal information")
+                    elif threat_type == "UNWANTED_SOFTWARE":
+                        threats.append("⚠️ UNWANTED SOFTWARE - Site may install harmful programs")
+                    elif threat_type == "POTENTIALLY_HARMFUL_APPLICATION":
+                        threats.append("⚠️ HARMFUL APPLICATION - Site contains dangerous applications")
+                
+                return {
+                    "is_safe": False,
+                    "threats": threats,
+                    "threat_types": threat_types,
+                    "checked": True
+                }
+            
+            return {
+                "is_safe": True,
+                "threats": [],
+                "threat_types": [],
+                "checked": True
+            }
+        else:
+            print(f"Safe Browsing API error: {response.status_code}")
+            return {
+                "is_safe": True,
+                "threats": [],
+                "threat_types": [],
+                "checked": False
+            }
+            
+    except Exception as e:
+        print(f"Safe Browsing check error: {e}")
+        return {
+            "is_safe": True,
+            "threats": [],
+            "threat_types": [],
+            "checked": False
+        }
+
+def check_suspicious_patterns(url: str, domain: str) -> Dict[str, Any]:
+    """Check for suspicious URL patterns and typosquatting"""
+    warnings = []
+    risk_score = 0
+    
+    # Check for suspicious TLDs
+    suspicious_tlds = ['.tk', '.ml', '.ga', '.cf', '.gq', '.pw', '.top', '.xyz', '.club', '.work', '.click']
+    for tld in suspicious_tlds:
+        if domain.endswith(tld):
+            warnings.append(f"Suspicious TLD detected: {tld} - Often used for scams")
+            risk_score += 15
+            break
+    
+    # Check for excessive subdomains
+    parts = domain.split('.')
+    if len(parts) > 3:
+        warnings.append(f"Multiple subdomains detected - Possible phishing attempt")
+        risk_score += 10
+    
+    # Check for typosquatting of popular brands
+    popular_brands = ['google', 'facebook', 'amazon', 'paypal', 'microsoft', 'apple', 
+                     'netflix', 'instagram', 'twitter', 'linkedin', 'youtube']
+    
+    for brand in popular_brands:
+        if brand in domain.lower() and not domain.lower().startswith(brand):
+            warnings.append(f"Possible typosquatting - Contains '{brand}' but isn't official site")
+            risk_score += 20
+            break
+    
+    # Check for excessive hyphens (common in phishing)
+    if domain.count('-') > 2:
+        warnings.append("Excessive hyphens in domain - Suspicious pattern")
+        risk_score += 10
+    
+    # Check for numbers in domain (sometimes suspicious)
+    if any(char.isdigit() for char in domain.replace('.', '')):
+        # Only flag if combined with other suspicious patterns
+        if risk_score > 0:
+            warnings.append("Numbers in domain combined with other suspicious patterns")
+            risk_score += 5
+    
+    # Check URL length (very long URLs are suspicious)
+    if len(url) > 100:
+        warnings.append("Extremely long URL - Possible obfuscation attempt")
+        risk_score += 10
+    
+    # Check for @ symbol (used in phishing to hide real domain)
+    if '@' in url:
+        warnings.append("@ symbol in URL - Common phishing technique")
+        risk_score += 25
+    
+    # Check for IP address instead of domain
+    ip_pattern = r'\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}'
+    if re.search(ip_pattern, domain):
+        warnings.append("IP address used instead of domain name - High risk")
+        risk_score += 20
+    
+    return {
+        "warnings": warnings,
+        "risk_score": risk_score,
+        "is_suspicious": risk_score > 15
+    }
 
 @app.post("/api/analyze")
 async def analyze_platform(request: AnalyzeRequest):
@@ -504,6 +654,10 @@ async def analyze_platform(request: AnalyzeRequest):
         ssl_info = check_ssl(url)
         content_info = analyze_content(url)
         
+        # CRITICAL: Check for malware/phishing
+        malware_check = check_google_safe_browsing(url)
+        suspicious_patterns = check_suspicious_patterns(url, domain)
+        
         # Get user comments
         user_comments_data = comments_db.get(domain, [])
         user_comment_count = len(user_comments_data)
@@ -514,6 +668,81 @@ async def analyze_platform(request: AnalyzeRequest):
         
         trust_score, findings = calculate_trust_score(domain_info, ssl_info, content_info)
         trust_score, findings = adjust_score_by_website_type(trust_score, website_type, findings)
+        
+        # AI analysis with Groq
+        ai_analysis = analyze_with_groq(domain, content_info.get("pageContent", ""), domain_info, ssl_info)
+        
+        # CRITICAL SECURITY CHECKS - Must be first
+        if not malware_check["is_safe"]:
+            # IMMEDIATE ALERT - Malware/Phishing detected
+            trust_score = 0
+            verdict = "Scam"
+            findings = []
+            
+            for threat in malware_check["threats"]:
+                findings.append({"type": "critical", "text": threat})
+            
+            findings.append({"type": "critical", "text": "🚨 DANGER: This site is flagged by Google Safe Browsing"})
+            findings.append({"type": "critical", "text": "DO NOT enter any personal information or download anything"})
+            
+            return {
+                "url": url,
+                "trustScore": 0,
+                "verdict": "Scam",
+                "domainAge": domain_info["age"],
+                "domainRegistered": domain_info["registered"],
+                "sslStatus": "UNSAFE - Malware/Phishing Detected",
+                "serverLocation": "⚠️ DANGEROUS SITE",
+                "whoisData": {
+                    "registrar": domain_info["registrar"],
+                    "owner": "⚠️ MALICIOUS",
+                    "email": "AVOID THIS SITE",
+                    "lastUpdated": datetime.now().strftime("%Y-%m-%d")
+                },
+                "contentAnalysis": {
+                    "aboutUsFound": False,
+                    "termsOfServiceFound": False,
+                    "contactInfoFound": False,
+                    "physicalAddressFound": False,
+                    "teamPhotosAnalyzed": False,
+                    "stockImagesDetected": False
+                },
+                "socialData": {
+                    "redditMentions": 0,
+                    "twitterMentions": 0,
+                    "trustpilotScore": 0,
+                    "scamAdvisorScore": 0
+                },
+                "withdrawalComplaints": 0,
+                "findings": findings,
+                "sentiment": {"positive": 0, "neutral": 0, "negative": 100},
+                "redFlags": malware_check["threat_types"],
+                "ponziCalculation": None,
+                "scamProbability": "CRITICAL - 100%",
+                "recommendation": "🚨 CRITICAL WARNING: This website has been identified as malicious by Google Safe Browsing. It may contain malware, attempt phishing attacks, or steal your personal information. DO NOT visit this site, enter any credentials, or download anything. Close this page immediately and report the URL.",
+                "peopleExperience": {
+                    "experienceScore": 0,
+                    "userExperienceRating": "DANGEROUS",
+                    "hasTestimonials": False,
+                    "hasSocialProof": False,
+                    "hasSupport": False
+                }
+            }
+        
+        # Check for suspicious patterns
+        if suspicious_patterns["is_suspicious"]:
+            trust_score -= suspicious_patterns["risk_score"]
+            for warning in suspicious_patterns["warnings"]:
+                findings.insert(0, {"type": "critical" if suspicious_patterns["risk_score"] > 30 else "warning", 
+                                   "text": warning})
+        
+        # Add AI analysis as first finding if available
+        if ai_analysis:
+            findings.insert(0, {"type": "info", "text": f"🤖 AI Analysis: {ai_analysis[:250])}"})
+        
+        # Add malware check status
+        if malware_check["checked"]:
+            findings.insert(0, {"type": "info", "text": "✅ No malware/phishing detected by Google Safe Browsing"})
         
         # Adjust for user comments
         if user_comment_count > 0:
