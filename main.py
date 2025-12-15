@@ -83,7 +83,12 @@ async def signup(request: SignUpRequest):
     """User sign up with Supabase"""
     try:
         if not supabase:
-            raise HTTPException(status_code=503, detail="Authentication service not available")
+            raise HTTPException(
+                status_code=503, 
+                detail="Authentication service not configured. Please contact administrator."
+            )
+        
+        print(f"Signup attempt for: {request.email}")
         
         # Sign up with Supabase Auth
         response = supabase.auth.sign_up({
@@ -96,37 +101,70 @@ async def signup(request: SignUpRequest):
             }
         })
         
+        print(f"Supabase response: {response}")
+        
         if response.user:
+            # Get token from session
+            token = response.session.access_token if response.session else None
+            
+            if not token:
+                # If no session (email confirmation required), still return success
+                return {
+                    "token": None,
+                    "user": {
+                        "id": response.user.id,
+                        "email": response.user.email,
+                        "name": request.name
+                    },
+                    "message": "Sign up successful! Please check your email to verify your account before signing in.",
+                    "needs_verification": True
+                }
+            
             return {
-                "token": response.session.access_token if response.session else None,
+                "token": token,
                 "user": {
                     "id": response.user.id,
                     "email": response.user.email,
                     "name": request.name
                 },
-                "message": "Sign up successful! Please check your email for verification."
+                "message": "Sign up successful!",
+                "needs_verification": False
             }
         else:
-            raise HTTPException(status_code=400, detail="Sign up failed")
+            raise HTTPException(status_code=400, detail="Sign up failed. Please try again.")
             
     except Exception as e:
         error_msg = str(e)
-        if "already registered" in error_msg.lower():
-            raise HTTPException(status_code=400, detail="Email already registered")
-        raise HTTPException(status_code=500, detail=f"Sign up error: {error_msg}")
+        print(f"Signup error: {error_msg}")
+        
+        if "already registered" in error_msg.lower() or "already exists" in error_msg.lower():
+            raise HTTPException(status_code=400, detail="This email is already registered. Please sign in instead.")
+        elif "invalid" in error_msg.lower() and "email" in error_msg.lower():
+            raise HTTPException(status_code=400, detail="Invalid email format. Please check and try again.")
+        elif "weak password" in error_msg.lower() or "password" in error_msg.lower():
+            raise HTTPException(status_code=400, detail="Password must be at least 6 characters long.")
+        else:
+            raise HTTPException(status_code=500, detail=f"Sign up error: {error_msg}")
 
 @app.post("/auth/login")
 async def login(request: LoginRequest):
     """User login with Supabase"""
     try:
         if not supabase:
-            raise HTTPException(status_code=503, detail="Authentication service not available")
+            raise HTTPException(
+                status_code=503, 
+                detail="Authentication service not configured. Please contact administrator."
+            )
+        
+        print(f"Login attempt for: {request.email}")
         
         # Sign in with Supabase Auth
         response = supabase.auth.sign_in_with_password({
             "email": request.email,
             "password": request.password
         })
+        
+        print(f"Login response received")
         
         if response.user and response.session:
             return {
@@ -138,13 +176,18 @@ async def login(request: LoginRequest):
                 }
             }
         else:
-            raise HTTPException(status_code=401, detail="Invalid credentials")
+            raise HTTPException(status_code=401, detail="Invalid email or password")
             
     except Exception as e:
         error_msg = str(e)
-        if "invalid" in error_msg.lower():
-            raise HTTPException(status_code=401, detail="Invalid email or password")
-        raise HTTPException(status_code=500, detail=f"Login error: {error_msg}")
+        print(f"Login error: {error_msg}")
+        
+        if "invalid" in error_msg.lower() or "credentials" in error_msg.lower():
+            raise HTTPException(status_code=401, detail="Invalid email or password. Please try again.")
+        elif "not confirmed" in error_msg.lower() or "email not confirmed" in error_msg.lower():
+            raise HTTPException(status_code=401, detail="Please verify your email before signing in. Check your inbox.")
+        else:
+            raise HTTPException(status_code=500, detail=f"Login error: {error_msg}")
 
 @app.get("/auth/user")
 async def get_user(authorization: Optional[str] = Header(None)):
@@ -307,10 +350,46 @@ def check_ssl(url: str) -> Dict[str, Any]:
         with socket.create_connection((hostname, 443), timeout=5) as sock:
             with context.wrap_socket(sock, server_hostname=hostname) as ssock:
                 cert = ssock.getpeercert()
+                if not cert:
+                    # No cert returned - treat as invalid to avoid None access
+                    return {
+                        "valid": False,
+                        "issuer": "None",
+                        "expires": "N/A"
+                    }
+                # Normalize the nested issuer structure into a flat dict safely
+                issuer = "Unknown"
+                try:
+                    issuer_raw = cert.get('issuer', ())
+                    issuer_items = []
+                    for rdn in issuer_raw:
+                        # rdn is typically a tuple/list of (key, value) tuples
+                        if isinstance(rdn, (list, tuple)):
+                            for attr in rdn:
+                                if isinstance(attr, (list, tuple)) and len(attr) >= 2:
+                                    k = attr[0]
+                                    v = attr[1]
+                                    # Ensure keys/values are str
+                                    if isinstance(k, bytes):
+                                        try:
+                                            k = k.decode()
+                                        except Exception:
+                                            k = str(k)
+                                    if isinstance(v, bytes):
+                                        try:
+                                            v = v.decode()
+                                        except Exception:
+                                            v = str(v)
+                                    issuer_items.append((k, v))
+                    issuer_dict = dict(issuer_items)
+                    # Try common attribute names used for organization
+                    issuer = issuer_dict.get('organizationName') or issuer_dict.get('O') or issuer_dict.get('organizationUnitName') or issuer_dict.get('commonName') or issuer_dict.get('CN') or "Unknown"
+                except Exception as _:
+                    issuer = "Unknown"
                 return {
                     "valid": True,
-                    "issuer": dict(x[0] for x in cert['issuer'])['organizationName'],
-                    "expires": cert['notAfter']
+                    "issuer": issuer,
+                    "expires": cert.get('notAfter')
                 }
     except Exception as e:
         print(f"SSL error: {e}")
