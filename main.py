@@ -882,7 +882,7 @@ async def analyze_platform(request: AnalyzeRequest):
         trust_score, findings = calculate_trust_score(domain_info, ssl_info, content_info)
         trust_score, findings = adjust_score_by_website_type(trust_score, website_type, findings)
         
-        # AI analysis with Groq
+        # AI analysis with Groq (now influences score)
         ai_analysis = analyze_with_groq(domain, content_info.get("pageContent", ""), domain_info, ssl_info)
         
         # CRITICAL SECURITY CHECKS - Must be first
@@ -948,6 +948,48 @@ async def analyze_platform(request: AnalyzeRequest):
             for warning in suspicious_patterns["warnings"]:
                 findings.insert(0, {"type": "critical" if suspicious_patterns["risk_score"] > 30 else "warning", 
                                    "text": warning})
+        
+        # Adjust score based on AI analysis text
+        if ai_analysis:
+            ai_text = ai_analysis.lower()
+            ai_adjustment = 0
+            ai_severity = "info"
+            
+            # Strong scam indicators
+            if any(phrase in ai_text for phrase in [
+                "potential scam",
+                "likely scam",
+                "high risk scam",
+                "highly suspicious",
+                "strong concerns about its legitimacy",
+            ]):
+                ai_adjustment -= 25
+                ai_severity = "critical"
+            # Moderate concerns
+            elif any(phrase in ai_text for phrase in [
+                "suspicious",
+                "red flags",
+                "concerns about",
+                "exercise caution",
+            ]):
+                ai_adjustment -= 10
+                ai_severity = "warning"
+            # Positive / legit signals
+            elif any(phrase in ai_text for phrase in [
+                "appears legitimate",
+                "no major red flags",
+                "no significant scam indicators",
+                "overall legitimate",
+            ]):
+                ai_adjustment += 8
+                ai_severity = "info"
+            
+            if ai_adjustment != 0:
+                trust_score += ai_adjustment
+                findings.insert(0, {
+                    "type": ai_severity,
+                    "text": f"AI analysis adjustment ({ai_adjustment:+}): {ai_analysis[:180]}..."
+                })
         
         # Add malware check status (don't add AI analysis to findings anymore)
         if malware_check["checked"]:
