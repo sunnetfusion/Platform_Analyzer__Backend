@@ -1,5 +1,5 @@
 # main.py
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Header
 from starlette.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import Optional, Dict, List, Any
@@ -12,10 +12,22 @@ import requests
 from bs4 import BeautifulSoup
 import re
 import os
+from supabase import create_client, Client
 from groq import Groq
 
 # Initialize FastAPI app
 app = FastAPI(title="Platform Analyzer API")
+
+# Initialize Supabase
+SUPABASE_URL = os.getenv("SUPABASE_URL")
+SUPABASE_KEY = os.getenv("SUPABASE_SERVICE_KEY")
+
+if SUPABASE_URL and SUPABASE_KEY:
+    supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
+    print("✅ Supabase connected")
+else:
+    supabase = None
+    print("⚠️ Supabase credentials not set")
 
 # Configure CORS
 app.add_middleware(
@@ -43,7 +55,16 @@ class CommentRequest(BaseModel):
     comment: str
     was_scammed: bool = False
 
-# In-memory storage for comments
+class SignUpRequest(BaseModel):
+    name: str
+    email: str
+    password: str
+
+class LoginRequest(BaseModel):
+    email: str
+    password: str
+
+# In-memory storage for comments (will migrate to Supabase later)
 comments_db: Dict[str, List[Dict[str, Any]]] = {}
 
 # Routes
@@ -52,8 +73,121 @@ async def root():
     return {
         "status": "online",
         "message": "Platform Analyzer API is running",
-        "version": "2.0.0"
+        "version": "2.0.0",
+        "supabase": "connected" if supabase else "not configured"
     }
+
+# Authentication endpoints with Supabase
+@app.post("/auth/signup")
+async def signup(request: SignUpRequest):
+    """User sign up with Supabase"""
+    try:
+        if not supabase:
+            raise HTTPException(status_code=503, detail="Authentication service not available")
+        
+        # Sign up with Supabase Auth
+        response = supabase.auth.sign_up({
+            "email": request.email,
+            "password": request.password,
+            "options": {
+                "data": {
+                    "name": request.name
+                }
+            }
+        })
+        
+        if response.user:
+            return {
+                "token": response.session.access_token if response.session else None,
+                "user": {
+                    "id": response.user.id,
+                    "email": response.user.email,
+                    "name": request.name
+                },
+                "message": "Sign up successful! Please check your email for verification."
+            }
+        else:
+            raise HTTPException(status_code=400, detail="Sign up failed")
+            
+    except Exception as e:
+        error_msg = str(e)
+        if "already registered" in error_msg.lower():
+            raise HTTPException(status_code=400, detail="Email already registered")
+        raise HTTPException(status_code=500, detail=f"Sign up error: {error_msg}")
+
+@app.post("/auth/login")
+async def login(request: LoginRequest):
+    """User login with Supabase"""
+    try:
+        if not supabase:
+            raise HTTPException(status_code=503, detail="Authentication service not available")
+        
+        # Sign in with Supabase Auth
+        response = supabase.auth.sign_in_with_password({
+            "email": request.email,
+            "password": request.password
+        })
+        
+        if response.user and response.session:
+            return {
+                "token": response.session.access_token,
+                "user": {
+                    "id": response.user.id,
+                    "email": response.user.email,
+                    "name": response.user.user_metadata.get("name", "")
+                }
+            }
+        else:
+            raise HTTPException(status_code=401, detail="Invalid credentials")
+            
+    except Exception as e:
+        error_msg = str(e)
+        if "invalid" in error_msg.lower():
+            raise HTTPException(status_code=401, detail="Invalid email or password")
+        raise HTTPException(status_code=500, detail=f"Login error: {error_msg}")
+
+@app.get("/auth/user")
+async def get_user(authorization: Optional[str] = Header(None)):
+    """Get current user from token"""
+    try:
+        if not supabase or not authorization:
+            raise HTTPException(status_code=401, detail="Not authenticated")
+        
+        # Extract token
+        token = authorization.replace("Bearer ", "")
+        
+        # Get user from Supabase
+        response = supabase.auth.get_user(token)
+        
+        if response.user:
+            return {
+                "user": {
+                    "id": response.user.id,
+                    "email": response.user.email,
+                    "name": response.user.user_metadata.get("name", "")
+                }
+            }
+        else:
+            raise HTTPException(status_code=401, detail="Invalid token")
+            
+    except Exception as e:
+        raise HTTPException(status_code=401, detail=f"Authentication error: {str(e)}")
+
+@app.post("/auth/google")
+async def google_auth():
+    """Get Google OAuth URL"""
+    try:
+        if not supabase:
+            raise HTTPException(status_code=503, detail="Authentication service not available")
+        
+        # Get OAuth URL from Supabase
+        # Note: You need to configure Google OAuth in Supabase dashboard first
+        return {
+            "url": f"{SUPABASE_URL}/auth/v1/authorize?provider=google",
+            "message": "Redirect user to this URL for Google sign-in"
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/api/comments")
 async def add_comment(comment: CommentRequest):
