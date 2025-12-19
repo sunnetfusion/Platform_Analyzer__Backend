@@ -1210,3 +1210,16 @@ async def test_job_ai_analysis():
 print("✅ Job Analyzer AI enhancement loaded")
 print("🤖 Groq AI will be used for job posting analysis")
 print("📊 AI insights will adjust trust scores by -30 to +10 points")
+
+def get_job_verdict(trust_score: int) -> str:
+    """Return a short human-readable verdict based on trust score (0-100)."""
+    try:
+        t = int(trust_score)
+    except Exception:
+        return "Unknown"
+
+    if t >= 70:
+        return "Likely Legitimate"
+    if t >= 40:
+        return "Possibly Suspicious"
+    return "Likely Scam"
