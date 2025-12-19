@@ -1,0 +1,221 @@
+-- =====================================================
+-- DYNAMIC STATS DATABASE SCHEMA
+-- Run this in Supabase SQL Editor
+-- =====================================================
+
+-- 1. Create analyses table (tracks every analysis)
+CREATE TABLE IF NOT EXISTS analyses (
+    id BIGSERIAL PRIMARY KEY,
+    user_id UUID REFERENCES auth.users(id) ON DELETE SET NULL,
+    type VARCHAR(20) NOT NULL CHECK (type IN ('website', 'job')),
+    url TEXT,
+    domain VARCHAR(255),
+    trust_score INTEGER CHECK (trust_score >= 0 AND trust_score <= 100),
+    verdict VARCHAR(50),
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+);
+
+-- 2. Create indexes for performance
+CREATE INDEX IF NOT EXISTS idx_analyses_type ON analyses(type);
+CREATE INDEX IF NOT EXISTS idx_analyses_verdict ON analyses(verdict);
+CREATE INDEX IF NOT EXISTS idx_analyses_trust_score ON analyses(trust_score);
+CREATE INDEX IF NOT EXISTS idx_analyses_created_at ON analyses(created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_analyses_user_id ON analyses(user_id);
+CREATE INDEX IF NOT EXISTS idx_analyses_domain ON analyses(domain);
+
+-- 3. Update comments table with loss prevention tracking
+ALTER TABLE comments 
+ADD COLUMN IF NOT EXISTS estimated_loss DECIMAL(10,2) DEFAULT 0,
+ADD COLUMN IF NOT EXISTS would_have_invested BOOLEAN DEFAULT false,
+ADD COLUMN IF NOT EXISTS can_feature BOOLEAN DEFAULT true;
+
+-- 4. Create user_profiles table for enhanced tracking
+CREATE TABLE IF NOT EXISTS user_profiles (
+    user_id UUID PRIMARY KEY REFERENCES auth.users(id) ON DELETE CASCADE,
+    country VARCHAR(2),
+    first_analysis_date TIMESTAMP WITH TIME ZONE,
+    total_analyses INTEGER DEFAULT 0,
+    last_analysis_date TIMESTAMP WITH TIME ZONE,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+    updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+);
+
+-- 5. Create index for user_profiles
+CREATE INDEX IF NOT EXISTS idx_user_profiles_country ON user_profiles(country);
+CREATE INDEX IF NOT EXISTS idx_user_profiles_total_analyses ON user_profiles(total_analyses);
+
+-- 6. Enable Row Level Security (RLS)
+ALTER TABLE analyses ENABLE ROW LEVEL SECURITY;
+ALTER TABLE user_profiles ENABLE ROW LEVEL SECURITY;
+
+-- 7. RLS Policies for analyses
+-- Anyone can view aggregate stats
+CREATE POLICY "Anyone can view analyses stats"
+    ON analyses FOR SELECT
+    USING (true);
+
+-- System can insert analyses (service role)
+CREATE POLICY "Service can insert analyses"
+    ON analyses FOR INSERT
+    WITH CHECK (true);
+
+-- Users can view their own analyses
+CREATE POLICY "Users can view own analyses"
+    ON analyses FOR SELECT
+    USING (auth.uid() = user_id);
+
+-- 8. RLS Policies for user_profiles
+CREATE POLICY "Users can view own profile"
+    ON user_profiles FOR SELECT
+    USING (auth.uid() = user_id);
+
+CREATE POLICY "Users can update own profile"
+    ON user_profiles FOR UPDATE
+    USING (auth.uid() = user_id);
+
+CREATE POLICY "Service can insert profiles"
+    ON user_profiles FOR INSERT
+    WITH CHECK (true);
+
+-- 9. Create function to auto-update user_profiles
+CREATE OR REPLACE FUNCTION update_user_profile_on_analysis()
+RETURNS TRIGGER AS $$
+BEGIN
+    -- Insert or update user profile
+    INSERT INTO user_profiles (user_id, first_analysis_date, total_analyses, last_analysis_date)
+    VALUES (NEW.user_id, NEW.created_at, 1, NEW.created_at)
+    ON CONFLICT (user_id) 
+    DO UPDATE SET
+        total_analyses = user_profiles.total_analyses + 1,
+        last_analysis_date = NEW.created_at,
+        updated_at = NOW();
+    
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+-- 10. Create trigger to auto-update user profiles
+CREATE TRIGGER trigger_update_user_profile
+    AFTER INSERT ON analyses
+    FOR EACH ROW
+    WHEN (NEW.user_id IS NOT NULL)
+    EXECUTE FUNCTION update_user_profile_on_analysis();
+
+-- 11. Create materialized view for stats (performance optimization)
+CREATE MATERIALIZED VIEW IF NOT EXISTS stats_summary AS
+SELECT
+    (SELECT COUNT(*) FROM analyses WHERE type = 'website') as websites_analyzed,
+    (SELECT COUNT(*) FROM analyses WHERE type = 'job') as jobs_verified,
+    (SELECT COUNT(*) FROM analyses WHERE trust_score < 40) as scams_detected,
+    (SELECT COUNT(*) FROM user_profiles) as registered_users,
+    (SELECT COUNT(DISTINCT country) FROM user_profiles WHERE country IS NOT NULL) as countries_count,
+    (SELECT COALESCE(AVG(rating), 0) FROM comments) as average_rating,
+    (SELECT COUNT(*) FROM comments) as community_contributions,
+    (SELECT COUNT(DISTINCT user_id) FROM user_profiles WHERE total_analyses > 1) as returning_users,
+    (SELECT COUNT(DISTINCT user_id) FROM user_profiles) as total_users;
+
+-- 12. Create index on materialized view
+CREATE UNIQUE INDEX IF NOT EXISTS idx_stats_summary ON stats_summary ((1));
+
+-- 13. Create function to refresh stats (call this periodically)
+CREATE OR REPLACE FUNCTION refresh_stats_summary()
+RETURNS void AS $$
+BEGIN
+    REFRESH MATERIALIZED VIEW CONCURRENTLY stats_summary;
+END;
+$$ LANGUAGE plpgsql;
+
+-- 14. Seed initial data (optional - for demo purposes)
+-- Uncomment if you want to start with baseline numbers
+/*
+INSERT INTO analyses (type, url, domain, trust_score, verdict, created_at)
+SELECT 
+    'website',
+    'https://demo-site-' || generate_series || '.com',
+    'demo-site-' || generate_series || '.com',
+    FLOOR(RANDOM() * 100),
+    CASE 
+        WHEN RANDOM() < 0.3 THEN 'Scam'
+        WHEN RANDOM() < 0.7 THEN 'Caution'
+        ELSE 'Legit'
+    END,
+    NOW() - (RANDOM() * INTERVAL '30 days')
+FROM generate_series(1, 10000);
+
+INSERT INTO analyses (type, url, domain, trust_score, verdict, created_at)
+SELECT 
+    'job',
+    'https://job-' || generate_series || '.com',
+    'job-' || generate_series || '.com',
+    FLOOR(RANDOM() * 100),
+    CASE 
+        WHEN RANDOM() < 0.2 THEN 'Likely Scam'
+        WHEN RANDOM() < 0.6 THEN 'Exercise Caution'
+        ELSE 'Legitimate Job'
+    END,
+    NOW() - (RANDOM() * INTERVAL '20 days')
+FROM generate_series(1, 5000);
+*/
+
+-- 15. Create view for featured testimonials
+CREATE OR REPLACE VIEW featured_testimonials AS
+SELECT 
+    id,
+    user_name,
+    rating,
+    comment,
+    created_at,
+    helpful_count,
+    was_scammed
+FROM comments
+WHERE 
+    rating >= 4
+    AND comment IS NOT NULL
+    AND LENGTH(comment) > 50
+    AND can_feature = true
+ORDER BY 
+    helpful_count DESC,
+    created_at DESC
+LIMIT 10;
+
+-- =====================================================
+-- VERIFICATION QUERIES (Run these to check)
+-- =====================================================
+
+-- Check if tables exist
+SELECT table_name 
+FROM information_schema.tables 
+WHERE table_schema = 'public' 
+AND table_name IN ('analyses', 'user_profiles');
+
+-- Check stats summary
+SELECT * FROM stats_summary;
+
+-- Check featured testimonials
+SELECT * FROM featured_testimonials;
+
+-- Count analyses
+SELECT 
+    type,
+    COUNT(*) as count,
+    AVG(trust_score) as avg_score
+FROM analyses
+GROUP BY type;
+
+-- =====================================================
+-- MAINTENANCE QUERIES
+-- =====================================================
+
+-- Refresh stats (run this every hour via cron or manually)
+SELECT refresh_stats_summary();
+
+-- Delete old analyses (optional - keep last 90 days)
+-- DELETE FROM analyses WHERE created_at < NOW() - INTERVAL '90 days';
+
+-- Get user retention rate
+SELECT 
+    ROUND(
+        (SELECT COUNT(DISTINCT user_id) FROM user_profiles WHERE total_analyses > 1)::NUMERIC / 
+        NULLIF((SELECT COUNT(DISTINCT user_id) FROM user_profiles), 0) * 100,
+        2
+    ) as retention_rate_percent;

@@ -255,6 +255,39 @@ def get_user_from_token(authorization: Optional[str]) -> Optional[Dict[str, Any]
     
     return None
 
+
+def log_analysis_to_db(
+    analysis_type: str,
+    url: Optional[str],
+    domain: Optional[str],
+    trust_score: Optional[int],
+    verdict: Optional[str],
+    user: Optional[Dict[str, Any]] = None,
+) -> None:
+    """
+    Helper to log each analysis into Supabase `analyses` table.
+    Fails soft: logging errors never break the main request.
+    """
+    if not supabase:
+        return
+
+    try:
+        payload: Dict[str, Any] = {
+            "type": analysis_type,
+            "url": url,
+            "domain": domain,
+            "trust_score": trust_score,
+            "verdict": verdict,
+        }
+
+        if user and user.get("id"):
+            payload["user_id"] = user["id"]
+
+        supabase.table("analyses").insert(payload).execute()
+    except Exception as e:
+        # Log but do not raise – analytics should never break core flow
+        print(f"Error logging analysis to Supabase: {e}")
+
 @app.post("/api/comments")
 async def add_comment(comment: CommentRequest, authorization: Optional[str] = Header(None)):
     """Add user comment/review for a website - NOW SAVES TO SUPABASE"""
@@ -710,9 +743,9 @@ def analyze_job_posting_url(url: str) -> Dict[str, Any]:
         # Unknown platform
         return {
             "is_legitimate_platform": False,
-            "platform": "Unknown/Unverified",
-            "trust_level": "Low",
-            "domain": domain,
+            "platform": "Invalid URL",
+            "trust_level": "Unknown",
+            "domain": "Invalid",
         }
     except Exception:
         return {
@@ -723,390 +756,67 @@ def analyze_job_posting_url(url: str) -> Dict[str, Any]:
         }
 
 
-def calculate_job_trust_score(
-    email_analysis: Dict[str, Any],
-    red_flags: List[Dict[str, str]],
-    salary_analysis: Dict[str, Any],
-    company_verification: Dict[str, Any],
-    platform_analysis: Dict[str, Any],
-) -> tuple:
-    """Calculate overall trust score for job posting"""
-    
-    score = 60  # Start at neutral
-    findings: List[Dict[str, str]] = []
-    
-    # Email domain analysis (20 points)
-    if email_analysis.get("is_corporate"):
-        score += 20
-        findings.append({
-            "type": "info",
-            "text": f"✓ Corporate email domain ({email_analysis.get('domain')}) - Legitimate indicator",
-        })
-    else:
-        score -= 15
-        findings.append({
-            "type": "warning",
-            "text": f"⚠ Free email service ({email_analysis.get('domain')}) - Not from company domain",
-        })
-    
-    # Platform analysis (15 points)
-    if platform_analysis.get("is_legitimate_platform"):
-        trust_level = platform_analysis.get("trust_level")
-        platform_name = platform_analysis.get("platform")
-        if trust_level == "Very High":
-            score += 15
-            findings.append({
-                "type": "info",
-                "text": f"✓ Posted on {platform_name} - Trusted platform",
-            })
-        elif trust_level == "High":
-            score += 10
-            findings.append({
-                "type": "info",
-                "text": f"✓ Posted on {platform_name} - Reputable platform",
-            })
-        else:
-            score += 5
-            findings.append({
-                "type": "info",
-                "text": f"Posted on {platform_name} - Exercise caution",
-            })
-    else:
-        score -= 10
-        findings.append({
-            "type": "warning",
-            "text": "⚠ Posted on unknown/unverified platform - Verify carefully",
-        })
-    
-    # Red flags (critical impact)
-    critical_flags = [f for f in red_flags if f.get("type") == "critical"]
-    warning_flags = [f for f in red_flags if f.get("type") == "warning"]
-    
-    if critical_flags:
-        score -= len(critical_flags) * 25
-        for flag in critical_flags:
-            findings.append({"type": "critical", "text": f"🚨 {flag.get('text')}"})
-    
-    if warning_flags:
-        score -= len(warning_flags) * 10
-        for flag in warning_flags:
-            findings.append({"type": "warning", "text": f"⚠ {flag.get('text')}"})
-    
-    # Salary analysis
-    if not salary_analysis.get("is_reasonable", True):
-        findings.append({
-            "type": "warning",
-            "text": f"⚠ Salary concern: {salary_analysis.get('assessment')}",
-        })
-        score -= 15
-    
-    # Company verification
-    legitimacy_score = company_verification.get("legitimacy_score", 0)
-    if legitimacy_score > 70:
-        score += 10
-    elif legitimacy_score < 40:
-        score -= 10
-    
-    for finding in company_verification.get("findings", []):
-        findings.append({"type": "info", "text": finding})
-    
-    # Ensure score is within bounds
-    score = max(0, min(100, score))
-    
-    return score, findings
+# ============================================
+# JOB ANALYZER AI ENHANCEMENT
+# ============================================
 
-
-def get_job_verdict(score: int) -> str:
-    """Get verdict based on job trust score"""
-    if score >= 70:
-        return "Legitimate Job"
-    elif score >= 40:
-        return "Exercise Caution"
-    else:
-        return "Likely Scam"
-
-def check_ssl(url: str) -> Dict[str, Any]:
-    """Check SSL certificate status"""
-    try:
-        hostname = urlparse(url).netloc
-        context = ssl.create_default_context()
-        
-        with socket.create_connection((hostname, 443), timeout=5) as sock:
-            with context.wrap_socket(sock, server_hostname=hostname) as ssock:
-                cert = ssock.getpeercert()
-                if not cert:
-                    return {
-                        "valid": False,
-                        "issuer": "None",
-                        "expires": "N/A"
-                    }
-                issuer = "Unknown"
-                try:
-                    issuer_raw = cert.get('issuer', ())
-                    issuer_items = []
-                    for rdn in issuer_raw:
-                        if isinstance(rdn, (list, tuple)):
-                            for attr in rdn:
-                                if isinstance(attr, (list, tuple)) and len(attr) >= 2:
-                                    k = attr[0]
-                                    v = attr[1]
-                                    if isinstance(k, bytes):
-                                        try:
-                                            k = k.decode()
-                                        except Exception:
-                                            k = str(k)
-                                    if isinstance(v, bytes):
-                                        try:
-                                            v = v.decode()
-                                        except Exception:
-                                            v = str(v)
-                                    issuer_items.append((k, v))
-                    issuer_dict = dict(issuer_items)
-                    issuer = issuer_dict.get('organizationName') or issuer_dict.get('O') or issuer_dict.get('organizationUnitName') or issuer_dict.get('commonName') or issuer_dict.get('CN') or "Unknown"
-                except Exception as _:
-                    issuer = "Unknown"
-                return {
-                    "valid": True,
-                    "issuer": issuer,
-                    "expires": cert.get('notAfter')
-                }
-    except Exception as e:
-        print(f"SSL error: {e}")
-        return {
-            "valid": False,
-            "issuer": "None",
-            "expires": "N/A"
-        }
-
-def analyze_content(url: str) -> Dict[str, Any]:
-    """Scrape and analyze website content"""
-    try:
-        headers = {'User-Agent': 'Mozilla/5.0'}
-        response = requests.get(url, headers=headers, timeout=10)
-        soup = BeautifulSoup(response.text, 'html.parser')
-        
-        text = soup.get_text().lower()
-        
-        has_about = bool(soup.find('a', href=re.compile(r'about', re.I)))
-        has_contact = bool(soup.find('a', href=re.compile(r'contact', re.I)))
-        has_terms = bool(soup.find('a', href=re.compile(r'terms', re.I)))
-        
-        address_pattern = r'\d+\s+[\w\s]+(?:street|st|avenue|ave|road|rd|boulevard|blvd)'
-        has_address = bool(re.search(address_pattern, text, re.I))
-        
-        phone_pattern = r'\b\d{3}[-.]?\d{3}[-.]?\d{4}\b'
-        has_phone = bool(re.search(phone_pattern, text))
-        
-        scam_keywords = ['guaranteed profit', 'get rich quick', 'no risk', 'double your money', 
-                        'limited time offer', 'act now', 'urgent', 'secret method']
-        red_flags = [kw for kw in scam_keywords if kw in text]
-        
-        stock_image_sites = ['shutterstock', 'istockphoto', 'gettyimages', 'dreamstime']
-        images = soup.find_all('img')
-        stock_images = sum(1 for img in images if any(site in str(img.get('src', '')) for site in stock_image_sites))
-        
-        page_text = ' '.join(soup.stripped_strings)[:2000]
-        
-        return {
-            "aboutUsFound": has_about,
-            "termsOfServiceFound": has_terms,
-            "contactInfoFound": has_contact,
-            "physicalAddressFound": has_address,
-            "phoneNumberFound": has_phone,
-            "stockImagesDetected": stock_images > 0,
-            "stockImageCount": stock_images,
-            "redFlagKeywords": red_flags,
-            "pageContent": page_text
-        }
-    except Exception as e:
-        print(f"Content analysis error: {e}")
-        return {
-            "aboutUsFound": False,
-            "termsOfServiceFound": False,
-            "contactInfoFound": False,
-            "physicalAddressFound": False,
-            "phoneNumberFound": False,
-            "stockImagesDetected": False,
-            "stockImageCount": 0,
-            "redFlagKeywords": [],
-            "pageContent": ""
-        }
-
-def calculate_trust_score(domain_info: Dict[str, Any], ssl_info: Dict[str, Any], 
-                         content_info: Dict[str, Any]) -> tuple:
-    """Calculate trust score based on various factors"""
-    score = 60
-    findings = []
-    
-    age_days = domain_info.get("age_days", 0)
-    if age_days > 365 * 5:
-        score += 25
-        findings.append({"type": "info", "text": f"Domain is {domain_info['age']} old - Very established"})
-    elif age_days > 365 * 2:
-        score += 15
-        findings.append({"type": "info", "text": f"Domain is {domain_info['age']} old - Established presence"})
-    elif age_days > 365:
-        score += 5
-        findings.append({"type": "info", "text": f"Domain is {domain_info['age']} old - Moderately established"})
-    elif age_days > 180:
-        findings.append({"type": "warning", "text": f"Domain is relatively new ({domain_info['age']})"})
-    elif age_days > 90:
-        score -= 5
-        findings.append({"type": "warning", "text": f"Domain is quite new ({domain_info['age']}) - Exercise caution"})
-    else:
-        score -= 15
-        findings.append({"type": "critical", "text": f"Very new domain ({domain_info['age']}) - Higher risk"})
-    
-    if ssl_info["valid"]:
-        score += 15
-        findings.append({"type": "info", "text": "Valid SSL certificate found - Secure connection"})
-    else:
-        score -= 25
-        findings.append({"type": "critical", "text": "No valid SSL certificate - UNSAFE for sensitive data"})
-    
-    content_score = 0
-    
-    if content_info["aboutUsFound"]:
-        content_score += 3
-        findings.append({"type": "info", "text": "About page found - Transparent about identity"})
-    
-    if content_info["contactInfoFound"]:
-        content_score += 5
-        findings.append({"type": "info", "text": "Contact information found - Reachable"})
-    else:
-        findings.append({"type": "warning", "text": "No obvious contact information found"})
-    
-    if content_info["termsOfServiceFound"]:
-        content_score += 3
-        findings.append({"type": "info", "text": "Terms of Service found - Professional"})
-    
-    if content_info["physicalAddressFound"]:
-        content_score += 8
-        findings.append({"type": "info", "text": "Physical address found - Legitimate business location"})
-    
-    if content_info.get("phoneNumberFound"):
-        content_score += 5
-        findings.append({"type": "info", "text": "Phone number found - Direct contact available"})
-    
-    score += content_score
-    
-    if content_info["stockImagesDetected"]:
-        stock_count = content_info.get("stockImageCount", 0)
-        if stock_count > 5:
-            score -= 15
-            findings.append({"type": "critical", "text": f"Many stock images detected ({stock_count}) - Potentially fake team"})
-        elif stock_count > 2:
-            score -= 8
-            findings.append({"type": "warning", "text": f"Stock images detected ({stock_count}) - Verify authenticity"})
-        else:
-            score -= 3
-            findings.append({"type": "warning", "text": "Some stock images detected"})
-    
-    if content_info["redFlagKeywords"]:
-        penalty = min(len(content_info["redFlagKeywords"]) * 8, 30)
-        score -= penalty
-        findings.append({"type": "critical", "text": f"Scam keywords detected: {', '.join(content_info['redFlagKeywords'][:3])}"})
-    
-    score = max(0, min(100, score))
-    
-    return score, findings
-
-def detect_website_type(domain: str, page_content: str) -> str:
-    """Detect the type of website to apply appropriate analysis"""
-    domain_lower = domain.lower()
-    content_lower = page_content.lower()
-    
-    edu_indicators = ['.edu', 'university', 'college', 'school', 'academy', 'institute', 'education']
-    if any(ind in domain_lower for ind in edu_indicators) or any(ind in content_lower for ind in ['student', 'faculty', 'research', 'academic']):
-        return 'educational'
-    
-    gov_indicators = ['.gov', '.gov.', 'government', 'ministry', 'department']
-    if any(ind in domain_lower for ind in gov_indicators):
-        return 'government'
-    
-    news_indicators = ['news', 'press', 'media', 'journal', 'magazine', 'blog']
-    if any(ind in domain_lower for ind in news_indicators):
-        return 'media'
-    
-    ecommerce_indicators = ['shop', 'store', 'cart', 'checkout', 'buy now', 'add to cart', 'product']
-    if any(ind in content_lower for ind in ecommerce_indicators):
-        return 'ecommerce'
-    
-    financial_indicators = ['invest', 'trading', 'forex', 'crypto', 'profit', 'returns', 'portfolio']
-    if any(ind in content_lower for ind in financial_indicators):
-        return 'financial'
-    
-    nonprofit_indicators = ['donate', 'charity', 'nonprofit', 'foundation', 'ngo', 'volunteer']
-    if any(ind in content_lower for ind in nonprofit_indicators):
-        return 'nonprofit'
-    
-    return 'general'
-
-def adjust_score_by_website_type(score: int, website_type: str, findings: List[Dict[str, str]]) -> tuple:
-    """Apply context-aware adjustments based on website type"""
-    adjustments = []
-    
-    if website_type == 'educational':
-        score += 10
-        adjustments.append({"type": "info", "text": "Educational institution detected - Higher trust baseline"})
-    elif website_type == 'government':
-        score += 15
-        adjustments.append({"type": "info", "text": "Government website detected - Official source"})
-    elif website_type == 'media':
-        score += 5
-        adjustments.append({"type": "info", "text": "News/Media website detected"})
-    elif website_type == 'nonprofit':
-        score += 5
-        adjustments.append({"type": "info", "text": "Non-profit organization detected"})
-    elif website_type == 'financial':
-        adjustments.append({"type": "warning", "text": "Financial/Investment platform - Requires thorough verification"})
-    elif website_type == 'ecommerce':
-        adjustments.append({"type": "info", "text": "E-commerce platform detected - Verify seller reputation"})
-    
-    findings.extend(adjustments)
-    return max(0, min(100, score)), findings
-
-def get_verdict(score: int) -> str:
-    """Get verdict based on trust score"""
-    if score >= 70:
-        return "Legit"
-    elif score >= 40:
-        return "Caution"
-    else:
-        return "Scam"
-
-def analyze_with_groq(domain: str, page_content: str, domain_info: Dict[str, Any], 
-                      ssl_info: Dict[str, Any]) -> Optional[str]:
-    """Use Groq AI to analyze the website content for scam indicators"""
+def analyze_job_with_ai(
+    company_name: str,
+    job_description: str,
+    salary: str,
+    recruiter_email: str,
+    job_url: str
+) -> Optional[str]:
+    """
+    Use Groq AI to analyze job posting for legitimacy and provide insights
+    """
     try:
         api_key = os.getenv("GROQ_API_KEY")
         if not api_key:
-            print("GROQ_API_KEY not set, skipping AI analysis")
+            print("GROQ_API_KEY not set, skipping AI job analysis")
             return None
-        
+
         client = Groq(api_key=api_key)
-        
-        prompt = f"""Analyze this website for legitimacy and scam indicators:
 
-Domain: {domain}
-Domain Age: {domain_info.get('age', 'Unknown')}
-SSL Certificate: {'Valid' if ssl_info.get('valid') else 'Invalid'}
+        email_domain = recruiter_email.split('@')[1] if '@' in recruiter_email else "not provided"
 
-Website Content (first 2000 chars):
-{page_content}
+        prompt = f"""Analyze this job posting for legitimacy and potential red flags:
 
-Provide a brief analysis covering:
-1. Overall legitimacy assessment (1-2 sentences)
-2. Top 3 red flags or concerns (if any)
-3. Top 3 positive indicators (if any)
+Company: {company_name or "Not specified"}
+Job Description: {job_description[:2000] if job_description else "Not provided"}
+Salary Offered: {salary or "Not specified"}
+Recruiter Email: {recruiter_email or "Not provided"} (Domain: {email_domain})
+Job URL: {job_url or "Not provided"}
 
-Keep response under 200 words."""
+Provide a comprehensive analysis covering:
+
+1. LEGITIMACY ASSESSMENT (2-3 sentences)
+   - Overall impression of this job posting
+   - Is this likely a real opportunity or potential scam?
+
+2. RED FLAGS (List top 3-5 concerns if any)
+   - Specific warning signs you notice
+   - Why each flag is concerning
+
+3. POSITIVE INDICATORS (List 2-3 if any)
+   - What suggests this might be legitimate
+   - Professional or trustworthy elements
+
+4. SALARY ANALYSIS
+   - Is the salary reasonable for this type of role?
+   - Any concerns about compensation structure?
+
+5. RECOMMENDATIONS
+   - Should the candidate proceed with this opportunity?
+   - What verification steps should they take?
+
+Keep response under 300 words, be direct and actionable."""
 
         chat_completion = client.chat.completions.create(
             messages=[
                 {
                     "role": "system",
-                    "content": "You are a cybersecurity expert specializing in scam detection and website legitimacy analysis."
+                    "content": "You are an expert employment fraud investigator and HR professional specializing in identifying job scams, fake recruiters, and fraudulent employment offers. You have 15+ years of experience in recruitment fraud prevention."
                 },
                 {
                     "role": "user",
@@ -1115,230 +825,206 @@ Keep response under 200 words."""
             ],
             model="llama-3.3-70b-versatile",
             temperature=0.3,
-            max_tokens=300
+            max_tokens=500
         )
-        
-        return chat_completion.choices[0].message.content
+
+        ai_analysis = chat_completion.choices[0].message.content
+        print(f"✅ AI job analysis completed: {len(ai_analysis)} characters")
+        return ai_analysis
+
     except Exception as e:
-        print(f"Groq analysis error: {e}")
+        print(f"Groq AI job analysis error: {e}")
         return None
 
-def check_google_safe_browsing(url: str) -> Dict[str, Any]:
-    """Check URL against Google Safe Browsing API for malware/phishing"""
-    try:
-        api_key = os.getenv("GOOGLE_SAFE_BROWSING_API_KEY")
-        if not api_key:
-            print("GOOGLE_SAFE_BROWSING_API_KEY not set, skipping malware check")
-            return {
-                "is_safe": True,
-                "threats": [],
-                "threat_types": [],
-                "checked": False,
-            }
-        
-        api_url = f"https://safebrowsing.googleapis.com/v4/threatMatches:find?key={api_key}"
-        
-        payload = {
-            "client": {
-                "clientId": "platform-analyzer",
-                "clientVersion": "1.0.0",
-            },
-            "threatInfo": {
-                "threatTypes": [
-                    "MALWARE",
-                    "SOCIAL_ENGINEERING",
-                    "UNWANTED_SOFTWARE",
-                    "POTENTIALLY_HARMFUL_APPLICATION",
-                ],
-                "platformTypes": ["ANY_PLATFORM"],
-                "threatEntryTypes": ["URL"],
-                "threatEntries": [{"url": url}],
-            },
-        }
-        
-        response = requests.post(api_url, json=payload, timeout=5)
-        
-        if response.status_code == 200:
-            data = response.json()
-            
-            if "matches" in data and len(data["matches"]) > 0:
-                threats: List[str] = []
-                threat_types: List[str] = []
-                
-                for match in data["matches"]:
-                    threat_type = match.get("threatType", "UNKNOWN")
-                    threat_types.append(threat_type)
-                    
-                    if threat_type == "MALWARE":
-                        threats.append("⚠️ MALWARE DETECTED - Site distributes malicious software")
-                    elif threat_type == "SOCIAL_ENGINEERING":
-                        threats.append("⚠️ PHISHING DETECTED - Site attempts to steal personal information")
-                    elif threat_type == "UNWANTED_SOFTWARE":
-                        threats.append("⚠️ UNWANTED SOFTWARE - Site may install harmful programs")
-                    elif threat_type == "POTENTIALLY_HARMFUL_APPLICATION":
-                        threats.append("⚠️ HARMFUL APPLICATION - Site contains dangerous applications")
-                
-                return {
-                    "is_safe": False,
-                    "threats": threats,
-                    "threat_types": threat_types,
-                    "checked": True,
-                }
-            
-            return {
-                "is_safe": True,
-                "threats": [],
-                "threat_types": [],
-                "checked": True,
-            }
-        else:
-            print(f"Safe Browsing API error: {response.status_code}")
-            return {
-                "is_safe": True,
-                "threats": [],
-                "threat_types": [],
-                "checked": False,
-            }
-    except Exception as e:
-        print(f"Safe Browsing check error: {e}")
+
+def extract_job_insights_from_ai(ai_analysis: str) -> Dict[str, Any]:
+    """
+    Extract structured insights from AI analysis to adjust trust score
+    """
+    if not ai_analysis:
         return {
-            "is_safe": True,
-            "threats": [],
-            "threat_types": [],
-            "checked": False,
+            "adjustment": 0,
+            "severity": "info",
+            "key_concern": None
         }
 
+    analysis_lower = ai_analysis.lower()
+    adjustment = 0
+    severity = "info"
+    key_concern = None
 
-def check_suspicious_patterns(url: str, domain: str) -> Dict[str, Any]:
-    """Check for suspicious URL patterns and typosquatting"""
-    warnings: List[str] = []
-    risk_score = 0
-    
-    # Check for suspicious TLDs
-    suspicious_tlds = ['.tk', '.ml', '.ga', '.cf', '.gq', '.pw', '.top', '.xyz', '.club', '.work', '.click']
-    for tld in suspicious_tlds:
-        if domain.endswith(tld):
-            warnings.append(f"Suspicious TLD detected: {tld} - Often used for scams")
-            risk_score += 15
-            break
-    
-    # Check for excessive subdomains
-    parts = domain.split('.')
-    if len(parts) > 3:
-        warnings.append("Multiple subdomains detected - Possible phishing attempt")
-        risk_score += 10
-    
-    # Check for typosquatting of popular brands
-    popular_brands = ['google', 'facebook', 'amazon', 'paypal', 'microsoft', 'apple', 
-                      'netflix', 'instagram', 'twitter', 'linkedin', 'youtube']
-    
-    for brand in popular_brands:
-        if brand in domain.lower() and not domain.lower().startswith(brand):
-            warnings.append(f"Possible typosquatting - Contains '{brand}' but isn't official site")
-            risk_score += 20
-            break
-    
-    # Check for excessive hyphens (common in phishing)
-    if domain.count('-') > 2:
-        warnings.append("Excessive hyphens in domain - Suspicious pattern")
-        risk_score += 10
-    
-    # Check for numbers in domain (sometimes suspicious)
-    if any(char.isdigit() for char in domain.replace('.', '')):
-        # Only flag if combined with other suspicious patterns
-        if risk_score > 0:
-            warnings.append("Numbers in domain combined with other suspicious patterns")
-            risk_score += 5
-    
-    # Check URL length (very long URLs are suspicious)
-    if len(url) > 100:
-        warnings.append("Extremely long URL - Possible obfuscation attempt")
-        risk_score += 10
-    
-    # Check for @ symbol (used in phishing to hide real domain)
-    if '@' in url:
-        warnings.append("@ symbol in URL - Common phishing technique")
-        risk_score += 25
-    
-    # Check for IP address instead of domain
-    ip_pattern = r'\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}'
-    if re.search(ip_pattern, domain):
-        warnings.append("IP address used instead of domain name - High risk")
-        risk_score += 20
-    
+    strong_scam_phrases = [
+        "this is a scam",
+        "definitely a scam",
+        "clear scam",
+        "obvious scam",
+        "highly suspicious",
+        "do not proceed",
+        "avoid this",
+        "major red flags",
+        "employment fraud",
+        "money laundering"
+    ]
+
+    moderate_concern_phrases = [
+        "red flags",
+        "concerns about",
+        "suspicious",
+        "exercise caution",
+        "verify carefully",
+        "potential scam",
+        "questionable",
+        "unusual",
+        "warning signs"
+    ]
+
+    positive_phrases = [
+        "appears legitimate",
+        "seems genuine",
+        "professional",
+        "no major red flags",
+        "reasonable opportunity",
+        "typical job posting",
+        "legitimate company",
+        "standard practices"
+    ]
+
+    if any(phrase in analysis_lower for phrase in strong_scam_phrases):
+        adjustment = -30
+        severity = "critical"
+        for phrase in strong_scam_phrases:
+            if phrase in analysis_lower:
+                key_concern = f"AI flagged: {phrase}"
+                break
+
+    elif any(phrase in analysis_lower for phrase in moderate_concern_phrases):
+        adjustment = -15
+        severity = "warning"
+        key_concern = "AI detected concerning patterns"
+
+    elif any(phrase in analysis_lower for phrase in positive_phrases):
+        adjustment = +10
+        severity = "info"
+
+    if "upfront" in analysis_lower and ("payment" in analysis_lower or "fee" in analysis_lower):
+        adjustment -= 20
+        severity = "critical"
+        key_concern = "AI detected upfront payment request - SCAM INDICATOR"
+
+    if "too good to be true" in analysis_lower:
+        adjustment -= 10
+        severity = "warning"
+        key_concern = "AI suspects unrealistic promises"
+
+    if "free email" in analysis_lower or "gmail" in analysis_lower or "yahoo" in analysis_lower:
+        if adjustment > -10:
+            adjustment -= 5
+
     return {
-        "warnings": warnings,
-        "risk_score": risk_score,
-        "is_suspicious": risk_score > 15,
+        "adjustment": adjustment,
+        "severity": severity,
+        "key_concern": key_concern
     }
 
+# ============================================
+# UPDATED /api/analyze-job ENDPOINT (AI-ENABLED)
+# Replaces previous /api/analyze-job implementation
+# ============================================
 
 @app.post("/api/analyze-job")
-async def analyze_job(request: JobAnalyzeRequest):
-    """Analyze job posting for authenticity and scam indicators"""
+async def analyze_job(request: JobAnalyzeRequest, authorization: Optional[str] = Header(None)):
+    """Analyze job posting for authenticity and scam indicators - NOW WITH AI!"""
     try:
-        print("Analyzing job posting...")
-        
-        # Extract data from request
+        print(f"🔍 Analyzing job posting with AI enhancement...")
+
         job_url = request.job_url or ""
         job_description = request.job_description or ""
         company_name = request.company_name or ""
         salary = request.salary or ""
         recruiter_email = request.recruiter_email or ""
-        
-        # If job URL provided, try to scrape content
+
         company_website = ""
         if job_url and not job_description:
             try:
                 headers = {'User-Agent': 'Mozilla/5.0'}
                 response = requests.get(job_url, headers=headers, timeout=10)
                 soup = BeautifulSoup(response.text, 'html.parser')
-                job_description = soup.get_text()[:5000]  # First 5000 chars
+                job_description = soup.get_text()[:5000]
             except Exception as e:
                 print(f"Failed to scrape job URL: {e}")
-        
-        # Perform analyses
+
         email_analysis = analyze_email_domain(recruiter_email)
         red_flags = detect_job_red_flags(job_description, salary)
         salary_analysis = analyze_salary_reasonableness(salary, company_name)
         company_verification = verify_company_online(company_name, company_website)
         platform_analysis = analyze_job_posting_url(job_url)
-        
-        # Calculate trust score
+
         trust_score, findings = calculate_job_trust_score(
             email_analysis,
             red_flags,
             salary_analysis,
             company_verification,
-            platform_analysis,
+            platform_analysis
         )
-        
+
+        # ✨ NEW: AI-POWERED ANALYSIS
+        print("🤖 Running AI analysis with Groq...")
+        ai_analysis = analyze_job_with_ai(
+            company_name=company_name,
+            job_description=job_description,
+            salary=salary,
+            recruiter_email=recruiter_email,
+            job_url=job_url
+        )
+
+        if ai_analysis:
+            ai_insights = extract_job_insights_from_ai(ai_analysis)
+
+            if ai_insights["adjustment"] != 0:
+                trust_score += ai_insights["adjustment"]
+                trust_score = max(0, min(100, trust_score))
+
+                ai_finding_text = f"AI Analysis: {ai_insights.get('key_concern', 'Additional insights provided')}"
+                if ai_insights["adjustment"] > 0:
+                    ai_finding_text = f"AI Analysis: No major concerns detected (+{ai_insights['adjustment']} trust)"
+                elif ai_insights["adjustment"] < 0:
+                    ai_finding_text = f"AI Analysis: {ai_insights.get('key_concern', 'Concerns detected')} ({ai_insights['adjustment']} trust)"
+
+                findings.insert(0, {
+                    "type": ai_insights["severity"],
+                    "text": ai_finding_text
+                })
+
+                print(f"🎯 AI adjustment: {ai_insights['adjustment']} points (severity: {ai_insights['severity']})")
+        else:
+            print("⚠️ AI analysis not available")
+
         verdict = get_job_verdict(trust_score)
-        
-        # Determine risk level
+
         if trust_score >= 70:
             risk_level = "Low Risk"
-            recommendation = (
-                "This job posting appears legitimate based on our analysis. However, "
-                "always verify company details and never send money or sensitive information "
-                "before being formally hired."
-            )
+            recommendation = "This job posting appears legitimate based on our AI-enhanced analysis. However, always verify company details and never send money or sensitive information before being formally hired. Research the company on LinkedIn and Glassdoor before proceeding."
         elif trust_score >= 40:
             risk_level = "Medium Risk"
-            recommendation = (
-                f"Exercise caution with this job posting. Trust score: {trust_score}/100. "
-                "We recommend additional research: verify the company exists, check reviews "
-                "on Glassdoor, and confirm the recruiter's identity on LinkedIn before proceeding."
-            )
+            recommendation = f"Exercise caution with this job posting (Trust: {trust_score}/100). Our AI detected some concerning patterns. Recommended actions: 1) Verify the company exists and has a real office, 2) Research the recruiter on LinkedIn, 3) Never pay any upfront fees, 4) Check reviews on Glassdoor, 5) Be wary of any urgency tactics."
         else:
             risk_level = "High Risk"
-            recommendation = (
-                f"⚠️ WARNING: This job posting shows multiple red flags indicating it may be a scam. "
-                f"Trust score: {trust_score}/100. We strongly recommend avoiding this opportunity "
-                "and reporting it to the job board."
+            recommendation = f"⚠️ WARNING: This job posting shows significant red flags (Trust: {trust_score}/100). Our AI analysis strongly suggests this may be a scam. DO NOT: send money, provide SSN/bank details, or click suspicious links. Report this posting to the job board immediately."
+
+        # Log analysis to Supabase (best-effort)
+        try:
+            user = get_user_from_token(authorization) if authorization else None
+            log_analysis_to_db(
+                analysis_type="job",
+                url=job_url or f"Job: {company_name}",
+                domain=(urlparse(job_url).netloc.lower().replace("www.", "") if job_url else company_name),
+                trust_score=int(trust_score) if isinstance(trust_score, (int, float)) else None,
+                verdict=verdict,
+                user=user,
             )
-        
-        # Prepare response
+        except Exception as e:
+            print(f"Failed to log job analysis: {e}")
+
         return {
             "trustScore": trust_score,
             "verdict": verdict,
@@ -1373,292 +1059,53 @@ async def analyze_job(request: JobAnalyzeRequest):
             "redFlags": red_flags,
             "totalRedFlags": len(red_flags),
             "criticalFlags": len([f for f in red_flags if f.get("type") == "critical"]),
+            "aiAnalysis": ai_analysis,
+            "aiEnhanced": ai_analysis is not None
         }
     except Exception as e:
         print(f"Job analysis error: {str(e)}")
+        import traceback
+        traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"Job analysis failed: {str(e)}")
 
 
-@app.get("/api/job-analyzer-status")
-async def job_analyzer_status():
-    """Check if job analyzer is available"""
-    return {
-        "status": "online",
-        "message": "Job Analyzer API is ready",
-        "version": "1.0.0",
+# ============================================
+# TESTING ENDPOINT (Remove in production)
+# ============================================
+
+@app.post("/api/test-job-ai")
+async def test_job_ai_analysis():
+    """Test endpoint to verify AI job analysis is working"""
+    test_job = {
+        "company_name": "Tech Startup Inc",
+        "job_description": "We're hiring a remote data entry specialist. No experience required! Earn $5000 per week working from home. Just pay a $299 training fee to get started. Act fast - only 3 positions left!",
+        "salary": "$5000/week",
+        "recruiter_email": "hiring@gmail.com",
+        "job_url": "https://suspicious-job-site.xyz/job123"
     }
 
-@app.post("/api/analyze")
-async def analyze_platform(request: AnalyzeRequest):
-    """Full website analysis with all checks"""
-    try:
-        url = request.url
-        
-        if not url.startswith(('http://', 'https://')):
-            url = 'https://' + url
-        
-        print(f"Analyzing: {url}")
-        
-        domain = urlparse(url).netloc.lower().replace('www.', '')
-        
-        KNOWN_LEGITIMATE = {
-            'instagram.com', 'facebook.com', 'twitter.com', 'x.com', 'youtube.com',
-            'linkedin.com', 'tiktok.com', 'reddit.com', 'pinterest.com', 'snapchat.com',
-            'whatsapp.com', 'telegram.org', 'discord.com', 'amazon.com', 'ebay.com',
-            'paypal.com', 'google.com', 'microsoft.com', 'apple.com', 'netflix.com', 'spotify.com'
-        }
-        
-        if domain in KNOWN_LEGITIMATE:
-            return {
-                "url": url,
-                "trustScore": 95,
-                "verdict": "Legit",
-                "domainAge": "Established",
-                "domainRegistered": "Long-standing platform",
-                "sslStatus": "Valid SSL Certificate",
-                "serverLocation": "Global CDN",
-                "whoisData": {
-                    "registrar": "Major Registrar",
-                    "owner": "Verified Corporation",
-                    "email": "Legal Contact",
-                    "lastUpdated": datetime.now().strftime("%Y-%m-%d")
-                },
-                "contentAnalysis": {
-                    "aboutUsFound": True,
-                    "termsOfServiceFound": True,
-                    "contactInfoFound": True,
-                    "physicalAddressFound": True,
-                    "teamPhotosAnalyzed": True,
-                    "stockImagesDetected": False
-                },
-                "socialData": {
-                    "redditMentions": 0,
-                    "twitterMentions": 0,
-                    "trustpilotScore": 0,
-                    "scamAdvisorScore": 95
-                },
-                "withdrawalComplaints": 0,
-                "findings": [
-                    {"type": "info", "text": "✓ Well-established, globally recognized platform"},
-                    {"type": "info", "text": "✓ Valid SSL certificate and security measures"},
-                    {"type": "info", "text": "✓ Trusted by millions of users worldwide"}
-                ],
-                "sentiment": {"positive": 80, "neutral": 15, "negative": 5},
-                "redFlags": [],
-                "ponziCalculation": None,
-                "scamProbability": "Very Low",
-                "recommendation": f"This is a legitimate, well-known platform. It's safe to use, but always follow standard security practices.",
-                "peopleExperience": {
-                    "experienceScore": 95,
-                    "userExperienceRating": "Excellent",
-                    "hasTestimonials": True,
-                    "hasSocialProof": True,
-                    "hasSupport": True
-                }
-            }
-        
-        domain_info = get_domain_age(url)
-        ssl_info = check_ssl(url)
-        content_info = analyze_content(url)
-        
-        malware_check = check_google_safe_browsing(url)
-        suspicious_patterns = check_suspicious_patterns(url, domain)
-        
-        # Get user comments from SUPABASE
-        try:
-            comments_result = supabase.table("comments")\
-                .select("*")\
-                .eq("domain", domain)\
-                .execute() if supabase else None
-            
-            user_comments_data = comments_result.data if comments_result and comments_result.data else []
-        except Exception as e:
-            print(f"Error fetching comments: {e}")
-            user_comments_data = []
-        
-        user_comment_count = len(user_comments_data)
-        user_scam_reports = sum(1 for c in user_comments_data if c.get("was_scammed", False))
-        user_avg_rating = sum(c.get("rating", 0) for c in user_comments_data) / user_comment_count if user_comment_count > 0 else 0
-        
-        website_type = detect_website_type(domain, content_info.get("pageContent", ""))
-        
-        trust_score, findings = calculate_trust_score(domain_info, ssl_info, content_info)
-        trust_score, findings = adjust_score_by_website_type(trust_score, website_type, findings)
-        
-        ai_analysis = analyze_with_groq(domain, content_info.get("pageContent", ""), domain_info, ssl_info)
-        
-        if not malware_check["is_safe"]:
-            trust_score = 0
-            verdict = "Scam"
-            findings = []
-            
-            for threat in malware_check["threats"]:
-                findings.append({"type": "critical", "text": threat})
-            
-            findings.append({"type": "critical", "text": "🚨 DANGER: This site is flagged by Google Safe Browsing"})
-            findings.append({"type": "critical", "text": "DO NOT enter any personal information or download anything"})
-            
-            return {
-                "url": url,
-                "trustScore": 0,
-                "verdict": "Scam",
-                "domainAge": domain_info["age"],
-                "domainRegistered": domain_info["registered"],
-                "sslStatus": "UNSAFE - Malware/Phishing Detected",
-                "serverLocation": "⚠️ DANGEROUS SITE",
-                "whoisData": {
-                    "registrar": domain_info["registrar"],
-                    "owner": "⚠️ MALICIOUS",
-                    "email": "AVOID THIS SITE",
-                    "lastUpdated": datetime.now().strftime("%Y-%m-%d")
-                },
-                "contentAnalysis": {
-                    "aboutUsFound": False,
-                    "termsOfServiceFound": False,
-                    "contactInfoFound": False,
-                    "physicalAddressFound": False,
-                    "teamPhotosAnalyzed": False,
-                    "stockImagesDetected": False
-                },
-                "socialData": {
-                    "redditMentions": 0,
-                    "twitterMentions": 0,
-                    "trustpilotScore": 0,
-                    "scamAdvisorScore": 0
-                },
-                "withdrawalComplaints": 0,
-                "findings": findings,
-                "sentiment": {"positive": 0, "neutral": 0, "negative": 100},
-                "redFlags": malware_check["threat_types"],
-                "ponziCalculation": None,
-                "scamProbability": "CRITICAL - 100%",
-                "recommendation": "🚨 CRITICAL WARNING: This website has been identified as malicious by Google Safe Browsing.",
-                "peopleExperience": {
-                    "experienceScore": 0,
-                    "userExperienceRating": "DANGEROUS",
-                    "hasTestimonials": False,
-                    "hasSocialProof": False,
-                    "hasSupport": False
-                }
-            }
-        
-        if suspicious_patterns["is_suspicious"]:
-            trust_score -= suspicious_patterns["risk_score"]
-            for warning in suspicious_patterns["warnings"]:
-                findings.insert(0, {"type": "critical" if suspicious_patterns["risk_score"] > 30 else "warning", 
-                                   "text": warning})
-        
-        if ai_analysis:
-            ai_text = ai_analysis.lower()
-            ai_adjustment = 0
-            ai_severity = "info"
-            
-            if any(phrase in ai_text for phrase in [
-                "potential scam", "likely scam", "high risk scam", "highly suspicious",
-                "strong concerns about its legitimacy",
-            ]):
-                ai_adjustment -= 25
-                ai_severity = "critical"
-            elif any(phrase in ai_text for phrase in [
-                "suspicious", "red flags", "concerns about", "exercise caution",
-            ]):
-                ai_adjustment -= 10
-                ai_severity = "warning"
-            elif any(phrase in ai_text for phrase in [
-                "appears legitimate", "no major red flags", "no significant scam indicators",
-                "overall legitimate",
-            ]):
-                ai_adjustment += 8
-                ai_severity = "info"
-            
-            if ai_adjustment != 0:
-                trust_score += ai_adjustment
-                findings.insert(0, {
-                    "type": ai_severity,
-                    "text": f"AI analysis adjustment ({ai_adjustment:+}): {ai_analysis[:180]}..."
-                })
-        
-        if malware_check["checked"]:
-            findings.insert(0, {"type": "info", "text": "✅ No malware/phishing detected by Google Safe Browsing"})
-        
-        if user_comment_count > 0:
-            if user_scam_reports > 3:
-                trust_score -= 20
-                findings.insert(0, {"type": "critical", "text": f"⚠️ {user_scam_reports} users reported being scammed!"})
-            elif user_scam_reports > 0:
-                trust_score -= 10
-                findings.insert(0, {"type": "warning", "text": f"{user_scam_reports} scam report(s) from users"})
-            
-            if user_avg_rating >= 4:
-                trust_score += 5
-                findings.insert(0, {"type": "info", "text": f"Users rate this site {user_avg_rating:.1f}/5 stars ({user_comment_count} reviews)"})
-            elif user_avg_rating <= 2:
-                trust_score -= 10
-                findings.insert(0, {"type": "warning", "text": f"Low user rating: {user_avg_rating:.1f}/5 stars ({user_comment_count} reviews)"})
-        
-        trust_score = max(0, min(100, trust_score))
-        verdict = get_verdict(trust_score)
-        scam_prob = "Low" if trust_score >= 70 else "Medium" if trust_score >= 40 else "High"
-        
-        if verdict == "Legit":
-            recommendation = "This website appears legitimate based on our analysis."
-        elif verdict == "Caution":
-            recommendation = f"Exercise caution with this website. Trust score: {trust_score}/100."
-        else:
-            recommendation = f"⚠️ WARNING: This website shows multiple red flags. Trust score: {trust_score}/100."
-        
-        return {
-            "url": url,
-            "trustScore": trust_score,
-            "verdict": verdict,
-            "domainAge": domain_info["age"],
-            "domainRegistered": domain_info["registered"],
-            "sslStatus": "Valid SSL Certificate" if ssl_info["valid"] else "No SSL Certificate",
-            "serverLocation": "Cloud Infrastructure",
-            "whoisData": {
-                "registrar": domain_info["registrar"],
-                "owner": "Privacy Protected",
-                "email": "Protected",
-                "lastUpdated": datetime.now().strftime("%Y-%m-%d")
-            },
-            "contentAnalysis": {
-                "aboutUsFound": content_info["aboutUsFound"],
-                "termsOfServiceFound": content_info["termsOfServiceFound"],
-                "contactInfoFound": content_info["contactInfoFound"],
-                "physicalAddressFound": content_info["physicalAddressFound"],
-                "teamPhotosAnalyzed": True,
-                "stockImagesDetected": content_info["stockImagesDetected"]
-            },
-            "socialData": {
-                "redditMentions": 0,
-                "twitterMentions": 0,
-                "trustpilotScore": 0,
-                "scamAdvisorScore": trust_score
-            },
-            "withdrawalComplaints": 0,
-            "findings": findings,
-            "sentiment": {
-                "positive": max(0, trust_score - 20),
-                "neutral": 40,
-                "negative": max(0, 80 - trust_score)
-            },
-            "redFlags": content_info["redFlagKeywords"],
-            "ponziCalculation": None,
-            "scamProbability": scam_prob,
-            "recommendation": recommendation,
-            "aiAnalysis": ai_analysis,
-            "peopleExperience": {
-                "experienceScore": trust_score,
-                "userExperienceRating": "Good" if trust_score >= 70 else "Fair" if trust_score >= 40 else "Poor",
-                "hasTestimonials": content_info["aboutUsFound"],
-                "hasSocialProof": user_comment_count > 10,
-                "hasSupport": content_info["contactInfoFound"]
-            }
-        }
-    except Exception as e:
-        print(f"Error: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Analysis failed: {str(e)}")
+    ai_result = analyze_job_with_ai(
+        company_name=test_job["company_name"],
+        job_description=test_job["job_description"],
+        salary=test_job["salary"],
+        recruiter_email=test_job["recruiter_email"],
+        job_url=test_job["job_url"]
+    )
 
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    if ai_result:
+        insights = extract_job_insights_from_ai(ai_result)
+        return {
+            "status": "success",
+            "ai_analysis": ai_result,
+            "extracted_insights": insights,
+            "message": "AI job analysis is working correctly!"
+        }
+    else:
+        return {
+            "status": "failed",
+            "message": "AI analysis not available. Check GROQ_API_KEY."
+        }
+
+print("✅ Job Analyzer AI enhancement loaded")
+print("🤖 Groq AI will be used for job posting analysis")
+print("📊 AI insights will adjust trust scores by -30 to +10 points")
