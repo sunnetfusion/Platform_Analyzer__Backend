@@ -926,6 +926,107 @@ def extract_job_insights_from_ai(ai_analysis: str) -> Dict[str, Any]:
         "key_concern": key_concern
     }
 
+def calculate_job_trust_score(
+    email_analysis: Dict[str, Any],
+    red_flags: List[Dict[str, str]],
+    salary_analysis: Dict[str, Any],
+    company_verification: Dict[str, Any],
+    platform_analysis: Dict[str, Any],
+) -> (int, List[Dict[str, str]]):
+    """
+    Compute a simple trust score (0-100) for a job posting and return
+    a list of human-readable findings. This is intentionally conservative
+    and deterministic so AI adjustments remain meaningful.
+    """
+    trust = 70  # base neutral score
+    findings: List[Dict[str, str]] = []
+
+    # Email analysis
+    try:
+        if email_analysis:
+            if not email_analysis.get("is_corporate", False):
+                trust -= 10
+                findings.append({
+                    "type": "warning",
+                    "text": f"Recruiter uses free email provider ({email_analysis.get('domain','unknown')})"
+                })
+            elif email_analysis.get("risk","").lower() == "critical":
+                trust -= 20
+                findings.append({
+                    "type": "critical",
+                    "text": f"Recruiter email appears invalid or malformed ({email_analysis.get('domain','invalid')})"
+                })
+    except Exception:
+        pass
+
+    # Red flags from description
+    for rf in red_flags:
+        severity = rf.get("type", "warning")
+        if severity == "critical":
+            trust -= 30
+            findings.append({"type": "critical", "text": rf.get("text", "Critical red flag detected")})
+        else:
+            trust -= 10
+            findings.append({"type": "warning", "text": rf.get("text", "Warning flag detected")})
+
+    # Salary analysis
+    try:
+        risk = (salary_analysis.get("risk") or "").lower()
+        if risk == "critical":
+            trust -= 20
+            findings.append({"type": "critical", "text": salary_analysis.get("assessment", "Suspicious salary")})
+        elif risk == "high":
+            trust -= 10
+            findings.append({"type": "warning", "text": salary_analysis.get("assessment", "Unusual salary")})
+        elif risk == "low" and salary_analysis.get("is_reasonable", False):
+            trust += 5
+            findings.append({"type": "info", "text": "Salary appears reasonable"})
+    except Exception:
+        pass
+
+    # Company verification
+    try:
+        legitimacy = int(company_verification.get("legitimacy_score", 50))
+        # scale legitimacy score delta into -20..+20
+        delta = (legitimacy - 50) // 2
+        trust += delta
+        for f in company_verification.get("findings", []):
+            # map prefix to type
+            t = "info"
+            if f.startswith("✗") or f.startswith("⚠"):
+                t = "warning"
+            findings.append({"type": t, "text": f})
+    except Exception:
+        pass
+
+    # Platform analysis
+    try:
+        plat_trust = platform_analysis.get("trust_level", "") or ""
+        if plat_trust.lower() in ("very high",):
+            trust += 10
+            findings.append({"type": "info", "text": f"Posted on trusted platform: {platform_analysis.get('platform','Unknown')}"})
+        elif plat_trust.lower() in ("high",):
+            trust += 5
+            findings.append({"type": "info", "text": f"Posted on reputable platform: {platform_analysis.get('platform','Unknown')}"})
+        elif plat_trust.lower() in ("medium",):
+            # no change, but note
+            findings.append({"type": "info", "text": f"Platform: {platform_analysis.get('platform','Unknown')}"})
+        else:
+            # Unknown or untrusted platform
+            trust -= 10
+            findings.append({"type": "warning", "text": f"Unrecognized or untrusted job platform ({platform_analysis.get('domain','unknown')})"})
+    except Exception:
+        pass
+
+    # Ensure bounds
+    trust = max(0, min(100, int(trust)))
+
+    # If no findings produced, add neutral note
+    if not findings:
+        findings.append({"type": "info", "text": "No immediate concerns detected from heuristics"})
+
+    return trust, findings
+
 # ============================================
 # UPDATED /api/analyze-job ENDPOINT (AI-ENABLED)
 # Replaces previous /api/analyze-job implementation
