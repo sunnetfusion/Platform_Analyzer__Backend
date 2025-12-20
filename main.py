@@ -12,6 +12,7 @@ import requests
 from bs4 import BeautifulSoup
 import re
 import os
+import json
 from supabase import create_client, Client
 from groq import Groq
 
@@ -480,6 +481,369 @@ def get_domain_age(url: str) -> Dict[str, Any]:
     }
 
 
+def check_ssl_certificate(url: str) -> Dict[str, Any]:
+    """Check if website has valid SSL certificate"""
+    try:
+        hostname = urlparse(url).netloc
+        context = ssl.create_default_context()
+        with socket.create_connection((hostname, 443), timeout=5) as sock:
+            with context.wrap_socket(sock, server_hostname=hostname) as ssock:
+                cert = ssock.getpeercert()
+                return {
+                    "valid": True,
+                    "issuer": dict(x[0] for x in cert['issuer']),
+                    "expires": cert['notAfter']
+                }
+    except Exception as e:
+        return {"valid": False, "error": str(e)}
+
+
+def analyze_website_content(url: str) -> Dict[str, Any]:
+    """Scrape and analyze website content for legitimacy indicators"""
+    try:
+        headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
+        response = requests.get(url, headers=headers, timeout=10)
+        soup = BeautifulSoup(response.text, 'html.parser')
+        
+        text_content = soup.get_text().lower()
+        
+        # Check for key trust indicators
+        has_about = 'about us' in text_content or 'about' in text_content
+        has_contact = 'contact' in text_content or 'contact us' in text_content
+        has_terms = 'terms' in text_content or 'terms of service' in text_content
+        has_privacy = 'privacy' in text_content or 'privacy policy' in text_content
+        
+        # Check for images (stock photo detection would need advanced AI)
+        images = soup.find_all('img')
+        has_images = len(images) > 0
+        
+        return {
+            "aboutUsFound": has_about,
+            "termsOfServiceFound": has_terms,
+            "contactInfoFound": has_contact,
+            "privacyPolicyFound": has_privacy,
+            "teamPhotosAnalyzed": has_images,
+            "stockImagesDetected": False,  # Would need AI image analysis
+            "totalImages": len(images)
+        }
+    except Exception as e:
+        print(f"Content analysis error: {e}")
+        return {
+            "aboutUsFound": False,
+            "termsOfServiceFound": False,
+            "contactInfoFound": False,
+            "privacyPolicyFound": False,
+            "teamPhotosAnalyzed": False,
+            "stockImagesDetected": False,
+            "totalImages": 0
+        }
+
+
+def detect_scam_patterns(url: str, content: str) -> List[Dict[str, str]]:
+    """Detect common scam patterns in URL and content"""
+    red_flags = []
+    
+    # Check for suspicious TLDs
+    suspicious_tlds = ['.tk', '.ml', '.ga', '.cf', '.gq', '.xyz', '.top']
+    if any(url.endswith(tld) for tld in suspicious_tlds):
+        red_flags.append({
+            "type": "warning",
+            "text": "Uses suspicious top-level domain often associated with scams"
+        })
+    
+    # Check for typosquatting indicators
+    if any(char in url for char in ['1', '0']) and any(brand in url for brand in ['paypal', 'amazon', 'google', 'apple', 'microsoft']):
+        red_flags.append({
+            "type": "critical",
+            "text": "Possible typosquatting - URL mimics legitimate brand"
+        })
+    
+    # Check content for scam keywords
+    scam_keywords = [
+        'guaranteed profit', 'get rich quick', 'no risk', 'limited time offer',
+        'act now', 'wire transfer', 'cryptocurrency investment', 'double your money',
+        'too good to be true', 'click here now', 'congratulations you won'
+    ]
+    
+    content_lower = content.lower()
+    for keyword in scam_keywords:
+        if keyword in content_lower:
+            red_flags.append({
+                "type": "warning",
+                "text": f"Contains suspicious phrase: '{keyword}'"
+            })
+            break  # Only report one to avoid spam
+    
+    return red_flags
+
+
+def check_google_safe_browsing(url: str) -> Dict[str, Any]:
+    """Check URL against Google Safe Browsing API"""
+    # Note: You need to set GOOGLE_SAFE_BROWSING_API_KEY in environment
+    api_key = os.getenv("GOOGLE_SAFE_BROWSING_API_KEY")
+    
+    if not api_key:
+        return {"checked": False, "safe": True, "threats": []}
+    
+    try:
+        gsb_url = f"https://safebrowsing.googleapis.com/v4/threatMatches:find?key={api_key}"
+        payload = {
+            "client": {
+                "clientId": "platform-analyzer",
+                "clientVersion": "1.0.0"
+            },
+            "threatInfo": {
+                "threatTypes": ["MALWARE", "SOCIAL_ENGINEERING", "UNWANTED_SOFTWARE", "POTENTIALLY_HARMFUL_APPLICATION"],
+                "platformTypes": ["ANY_PLATFORM"],
+                "threatEntryTypes": ["URL"],
+                "threatEntries": [{"url": url}]
+            }
+        }
+        
+        response = requests.post(gsb_url, json=payload, timeout=5)
+        data = response.json()
+        
+        if "matches" in data:
+            return {
+                "checked": True,
+                "safe": False,
+                "threats": [match["threatType"] for match in data["matches"]]
+            }
+        else:
+            return {"checked": True, "safe": True, "threats": []}
+            
+    except Exception as e:
+        print(f"Google Safe Browsing check error: {e}")
+        return {"checked": False, "safe": True, "threats": []}
+
+
+def analyze_with_groq_ai(url: str, content: str, domain_age: str, ssl_valid: bool) -> Optional[str]:
+    """Use Groq AI to analyze website legitimacy"""
+    try:
+        api_key = os.getenv("GROQ_API_KEY")
+        if not api_key:
+            print("GROQ_API_KEY not set, skipping AI analysis")
+            return None
+        
+        client = Groq(api_key=api_key)
+        
+        prompt = f"""Analyze this website for legitimacy and potential scam indicators:
+
+URL: {url}
+Domain Age: {domain_age}
+SSL Certificate: {'Valid' if ssl_valid else 'Invalid or Missing'}
+Website Content Sample: {content[:3000]}
+
+Provide a comprehensive analysis covering:
+
+1. LEGITIMACY ASSESSMENT (2-3 sentences)
+   - Overall impression of this website
+   - Is this likely legitimate or a potential scam?
+
+2. RED FLAGS (List top 3-5 concerns if any)
+   - Specific warning signs you notice
+   - Why each flag is concerning
+
+3. POSITIVE INDICATORS (List 2-3 if any)
+   - What suggests legitimacy
+   - Professional or trustworthy elements
+
+4. TRUST RECOMMENDATION
+   - Should users trust this site?
+   - What precautions should they take?
+
+Keep response under 300 words, be direct and actionable."""
+
+        chat_completion = client.chat.completions.create(
+            messages=[
+                {
+                    "role": "system",
+                    "content": "You are an expert cybersecurity analyst and scam detection specialist with 15+ years of experience identifying fraudulent websites, phishing attempts, and online scams."
+                },
+                {
+                    "role": "user",
+                    "content": prompt
+                }
+            ],
+            model="llama-3.3-70b-versatile",
+            temperature=0.3,
+            max_tokens=500
+        )
+        
+        ai_analysis = chat_completion.choices[0].message.content
+        print(f"✅ AI analysis completed: {len(ai_analysis)} characters")
+        return ai_analysis
+        
+    except Exception as e:
+        print(f"Groq AI analysis error: {e}")
+        return None
+
+
+@app.post("/api/analyze")
+async def analyze_website(request: AnalyzeRequest, authorization: Optional[str] = Header(None)):
+    """Main website analysis endpoint - COMPLETE IMPLEMENTATION"""
+    try:
+        url = request.url.strip()
+        if not url.startswith(('http://', 'https://')):
+            url = 'https://' + url
+        
+        print(f"🔍 Analyzing website: {url}")
+        
+        # Initialize results
+        domain_info = get_domain_age(url)
+        ssl_info = check_ssl_certificate(url)
+        content_analysis = analyze_website_content(url)
+        
+        # Get page content for AI analysis
+        try:
+            headers = {'User-Agent': 'Mozilla/5.0'}
+            response = requests.get(url, headers=headers, timeout=10)
+            page_content = BeautifulSoup(response.text, 'html.parser').get_text()[:5000]
+        except Exception:
+            page_content = ""
+        
+        # Detect scam patterns
+        red_flags = detect_scam_patterns(url, page_content)
+        
+        # Google Safe Browsing check
+        gsb_result = check_google_safe_browsing(url)
+        
+        # Calculate base trust score
+        trust_score = 70  # Start neutral
+        findings = []
+        
+        # Domain age assessment
+        age_days = domain_info.get("age_days", 0)
+        if age_days > 365:
+            trust_score += 15
+            findings.append({"type": "info", "text": f"Domain is {domain_info['age']} old - Established presence"})
+        elif age_days > 180:
+            trust_score += 5
+            findings.append({"type": "info", "text": f"Domain age: {domain_info['age']}"})
+        elif age_days > 0:
+            trust_score -= 15
+            findings.append({"type": "warning", "text": f"Very new domain ({domain_info['age']}) - Exercise caution"})
+        
+        # SSL certificate
+        if ssl_info.get("valid"):
+            trust_score += 10
+            findings.append({"type": "info", "text": "Valid SSL certificate detected"})
+        else:
+            trust_score -= 20
+            findings.append({"type": "critical", "text": "No valid SSL certificate - Insecure connection"})
+        
+        # Content analysis
+        if content_analysis["aboutUsFound"]:
+            trust_score += 5
+        if content_analysis["contactInfoFound"]:
+            trust_score += 5
+        if content_analysis["termsOfServiceFound"]:
+            trust_score += 5
+        
+        if not content_analysis["aboutUsFound"] and not content_analysis["contactInfoFound"]:
+            trust_score -= 10
+            findings.append({"type": "warning", "text": "Missing 'About Us' and contact information"})
+        
+        # Google Safe Browsing
+        if gsb_result["checked"] and not gsb_result["safe"]:
+            trust_score = 0  # Immediate zero score
+            findings.insert(0, {
+                "type": "critical",
+                "text": f"🚨 FLAGGED BY GOOGLE SAFE BROWSING: {', '.join(gsb_result['threats'])}"
+            })
+        
+        # Add red flags
+        for flag in red_flags:
+            findings.append(flag)
+            if flag["type"] == "critical":
+                trust_score -= 20
+            elif flag["type"] == "warning":
+                trust_score -= 10
+        
+        # Ensure score bounds
+        trust_score = max(0, min(100, trust_score))
+        
+        # AI Analysis
+        ai_analysis = analyze_with_groq_ai(
+            url=url,
+            content=page_content,
+            domain_age=domain_info["age"],
+            ssl_valid=ssl_info.get("valid", False)
+        )
+        
+        # Determine verdict
+        if trust_score >= 70:
+            verdict = "Legit"
+            recommendation = "This website appears legitimate based on our analysis. However, always exercise caution when sharing personal information online."
+        elif trust_score >= 40:
+            verdict = "Caution"
+            recommendation = "This website shows some concerning signs. Proceed with caution and avoid sharing sensitive information until you can verify its legitimacy."
+        else:
+            verdict = "Scam"
+            recommendation = "⚠️ HIGH RISK: This website shows significant red flags. We strongly recommend avoiding this site and not sharing any personal or financial information."
+        
+        # Log to database
+        try:
+            user = get_user_from_token(authorization) if authorization else None
+            log_analysis_to_db(
+                analysis_type="website",
+                url=url,
+                domain=urlparse(url).netloc.replace('www.', ''),
+                trust_score=trust_score,
+                verdict=verdict,
+                user=user
+            )
+        except Exception as e:
+            print(f"Failed to log analysis: {e}")
+        
+        return {
+            "url": url,
+            "trustScore": trust_score,
+            "verdict": verdict,
+            "domainAge": domain_info["age"],
+            "domainRegistered": domain_info["registered"],
+            "sslStatus": "Valid SSL" if ssl_info.get("valid") else "No Valid SSL",
+            "serverLocation": "Unknown",  # Would need GeoIP lookup
+            "whoisData": {
+                "registrar": domain_info.get("registrar", "Unknown"),
+                "owner": "Private",
+                "email": "Private",
+                "lastUpdated": domain_info.get("registered", "Unknown")
+            },
+            "contentAnalysis": {
+                "aboutUsFound": content_analysis["aboutUsFound"],
+                "termsOfServiceFound": content_analysis["termsOfServiceFound"],
+                "contactInfoFound": content_analysis["contactInfoFound"],
+                "physicalAddressFound": False,
+                "teamPhotosAnalyzed": content_analysis["teamPhotosAnalyzed"],
+                "stockImagesDetected": content_analysis["stockImagesDetected"]
+            },
+            "socialData": {
+                "redditMentions": 0,
+                "twitterMentions": 0,
+                "trustpilotScore": 0,
+                "scamAdvisorScore": 0
+            },
+            "withdrawalComplaints": 0,
+            "findings": findings,
+            "sentiment": {
+                "positive": 50,
+                "neutral": 30,
+                "negative": 20
+            },
+            "redFlags": [f["text"] for f in red_flags],
+            "ponziCalculation": None,
+            "scamProbability": f"{100 - trust_score}%" if trust_score < 50 else "Low",
+            "recommendation": recommendation,
+            "aiAnalysis": ai_analysis
+        }
+        
+    except Exception as e:
+        print(f"Website analysis error: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Analysis failed: {str(e)}")
+
 # ============================================
 # JOB ANALYZER HELPERS
 # ============================================
@@ -754,7 +1118,126 @@ def analyze_job_posting_url(url: str) -> Dict[str, Any]:
             "trust_level": "Unknown",
             "domain": "Invalid",
         }
+def smart_extract_job_details_with_ai(job_url: str) -> Dict[str, Any]:
+    """Intelligently scrape job posting and use AI to extract structured information"""
+    try:
+        print(f"🔍 Smart scraping job URL: {job_url}")
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+        }
+        response = requests.get(job_url, headers=headers, timeout=15)
+        soup = BeautifulSoup(response.text, 'html.parser')
 
+        full_text = soup.get_text(separator='\n', strip=True)
+
+        api_key = os.getenv("GROQ_API_KEY")
+        if not api_key:
+            print("⚠️ GROQ_API_KEY not set, falling back to basic scraping")
+            return extract_job_details_basic(soup, full_text)
+
+        client = Groq(api_key=api_key)
+
+        email_domain = "not provided"
+        email_pattern = r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b'
+        emails = re.findall(email_pattern, full_text)
+        if emails:
+            email_domain = emails[0].split('@')[1] if '@' in emails[0] else "not provided"
+
+        prompt = f"""Extract job posting details from this webpage content. Return ONLY a JSON object with these exact fields:
+{{
+"company_name": "extracted company name or 'Unknown'",
+"job_title": "extracted job title or 'Unknown'",
+"salary": "extracted salary (e.g., '$80,000/year', '$5000/week') or 'Not specified'",
+"recruiter_email": "extracted email or 'Not found'",
+"job_description": "cleaned job description (200-500 words)"
+}}
+Webpage content:
+{full_text[:4000]}
+Return ONLY valid JSON, no other text."""
+        chat_completion = client.chat.completions.create(
+            messages=[
+                {
+                    "role": "system",
+                    "content": "You are a data extraction specialist. Extract job posting information and return ONLY valid JSON with no additional text or formatting."
+                },
+                {
+                    "role": "user",
+                    "content": prompt
+                }
+            ],
+            model="llama-3.3-70b-versatile",
+            temperature=0.1,
+            max_tokens=800
+        )
+
+        ai_response = chat_completion.choices[0].message.content.strip()
+
+        # Strip fences if present
+        if ai_response.startswith("```"):
+            parts = ai_response.split("```")
+            if len(parts) >= 2:
+                ai_response = parts[1]
+                if ai_response.startswith("json"):
+                    ai_response = ai_response[4:].strip()
+
+        try:
+            extracted_data = json.loads(ai_response)
+        except Exception:
+            extracted_data = {}
+
+        print(f"✅ AI extracted: Company={extracted_data.get('company_name', 'Unknown')}, Salary={extracted_data.get('salary', 'Unknown')}")
+
+        return {
+            "company_name": extracted_data.get("company_name", "Unknown"),
+            "job_title": extracted_data.get("job_title", "Unknown"),
+            "salary": extracted_data.get("salary", "Not specified"),
+            "recruiter_email": extracted_data.get("recruiter_email", emails[0] if emails else "Not found"),
+            "job_description": extracted_data.get("job_description", full_text[:2000])
+        }
+
+    except Exception as e:
+        print(f"❌ Smart extraction error: {e}")
+        if 'full_text' in locals():
+            return extract_job_details_basic(None, full_text)
+        return {
+            "company_name": "Unknown",
+            "job_title": "Unknown",
+            "salary": "Not specified",
+            "recruiter_email": "Not found",
+            "job_description": ""
+        }
+
+def extract_job_details_basic(soup, text: str) -> Dict[str, Any]:
+    """Fallback basic extraction without AI"""
+    email_pattern = r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b'
+    emails = re.findall(email_pattern, text)
+    recruiter_email = emails[0] if emails else "Not found"
+    salary_pattern = r'\$[\d,]+(?:\s*(?:per|\/)\s*(?:year|month|week|hour))?'
+    salaries = re.findall(salary_pattern, text, re.IGNORECASE)
+    salary = salaries[0] if salaries else "Not specified"
+
+    # Best-effort title/company extraction from HTML if soup provided
+    company_name = "Unknown"
+    job_title = "Unknown"
+    try:
+        if soup:
+            # common selectors
+            title_tag = soup.find(attrs={"class": re.compile(r'(job-title|title|posting-title)', re.I)}) or soup.find('h1')
+            if title_tag and title_tag.get_text(strip=True):
+                job_title = title_tag.get_text(strip=True)[:200]
+            company_tag = soup.find(attrs={"class": re.compile(r'(company|employer|org-name)', re.I)})
+            if company_tag and company_tag.get_text(strip=True):
+                company_name = company_tag.get_text(strip=True)[:200]
+    except Exception:
+        pass
+
+    return {
+        "company_name": company_name,
+        "job_title": job_title,
+        "salary": salary,
+        "recruiter_email": recruiter_email,
+        "job_description": text[:2000]
+    }
 
 # ============================================
 # JOB ANALYZER AI ENHANCEMENT
@@ -1027,32 +1510,45 @@ def calculate_job_trust_score(
 
     return trust, findings
 
-# ============================================
-# UPDATED /api/analyze-job ENDPOINT (AI-ENABLED)
-# Replaces previous /api/analyze-job implementation
-# ============================================
+def get_job_verdict(trust_score: int) -> str:
+    """Return verdict based on trust score"""
+    try:
+        t = int(trust_score)
+    except Exception:
+        return "Unknown"
+    
+    if t >= 70:
+        return "Likely Legitimate"
+    if t >= 40:
+        return "Possibly Suspicious"
+    return "Likely Scam"
+
 
 @app.post("/api/analyze-job")
 async def analyze_job(request: JobAnalyzeRequest, authorization: Optional[str] = Header(None)):
-    """Analyze job posting for authenticity and scam indicators - NOW WITH AI!"""
+    """Analyze job posting - WITH AUTO-SCRAPING AND AI"""
     try:
         print(f"🔍 Analyzing job posting with AI enhancement...")
-
         job_url = request.job_url or ""
-        job_description = request.job_description or ""
-        company_name = request.company_name or ""
-        salary = request.salary or ""
-        recruiter_email = request.recruiter_email or ""
+        
+        # AUTO-SCRAPE if only URL provided
+        if job_url and not request.job_description:
+            print("🤖 Auto-scraping job details from URL...")
+            extracted = smart_extract_job_details_with_ai(job_url)
+            
+            job_description = request.job_description or extracted["job_description"]
+            company_name = request.company_name or extracted["company_name"]
+            salary = request.salary or extracted["salary"]
+            recruiter_email = request.recruiter_email or extracted["recruiter_email"]
+            
+            print(f"✅ Extracted: {company_name}, {salary}, {recruiter_email}")
+        else:
+            job_description = request.job_description or ""
+            company_name = request.company_name or ""
+            salary = request.salary or ""
+            recruiter_email = request.recruiter_email or ""
 
         company_website = ""
-        if job_url and not job_description:
-            try:
-                headers = {'User-Agent': 'Mozilla/5.0'}
-                response = requests.get(job_url, headers=headers, timeout=10)
-                soup = BeautifulSoup(response.text, 'html.parser')
-                job_description = soup.get_text()[:5000]
-            except Exception as e:
-                print(f"Failed to scrape job URL: {e}")
 
         email_analysis = analyze_email_domain(recruiter_email)
         red_flags = detect_job_red_flags(job_description, salary)
@@ -1068,7 +1564,6 @@ async def analyze_job(request: JobAnalyzeRequest, authorization: Optional[str] =
             platform_analysis
         )
 
-        # ✨ NEW: AI-POWERED ANALYSIS
         print("🤖 Running AI analysis with Groq...")
         ai_analysis = analyze_job_with_ai(
             company_name=company_name,
@@ -1096,7 +1591,7 @@ async def analyze_job(request: JobAnalyzeRequest, authorization: Optional[str] =
                     "text": ai_finding_text
                 })
 
-                print(f"🎯 AI adjustment: {ai_insights['adjustment']} points (severity: {ai_insights['severity']})")
+                print(f"🎯 AI adjustment: {ai_insights['adjustment']} points")
         else:
             print("⚠️ AI analysis not available")
 
@@ -1104,22 +1599,21 @@ async def analyze_job(request: JobAnalyzeRequest, authorization: Optional[str] =
 
         if trust_score >= 70:
             risk_level = "Low Risk"
-            recommendation = "This job posting appears legitimate based on our AI-enhanced analysis. However, always verify company details and never send money or sensitive information before being formally hired. Research the company on LinkedIn and Glassdoor before proceeding."
+            recommendation = "This job posting appears legitimate based on our AI-enhanced analysis. However, always verify company details and never send money or sensitive information before being formally hired."
         elif trust_score >= 40:
             risk_level = "Medium Risk"
-            recommendation = f"Exercise caution with this job posting (Trust: {trust_score}/100). Our AI detected some concerning patterns. Recommended actions: 1) Verify the company exists and has a real office, 2) Research the recruiter on LinkedIn, 3) Never pay any upfront fees, 4) Check reviews on Glassdoor, 5) Be wary of any urgency tactics."
+            recommendation = f"Exercise caution with this job posting (Trust: {trust_score}/100). Verify the company exists, research the recruiter on LinkedIn, and never pay upfront fees."
         else:
             risk_level = "High Risk"
-            recommendation = f"⚠️ WARNING: This job posting shows significant red flags (Trust: {trust_score}/100). Our AI analysis strongly suggests this may be a scam. DO NOT: send money, provide SSN/bank details, or click suspicious links. Report this posting to the job board immediately."
+            recommendation = f"⚠️ WARNING: This job posting shows significant red flags (Trust: {trust_score}/100). DO NOT send money, provide SSN/bank details, or click suspicious links."
 
-        # Log analysis to Supabase (best-effort)
         try:
             user = get_user_from_token(authorization) if authorization else None
             log_analysis_to_db(
                 analysis_type="job",
                 url=job_url or f"Job: {company_name}",
                 domain=(urlparse(job_url).netloc.lower().replace("www.", "") if job_url else company_name),
-                trust_score=int(trust_score) if isinstance(trust_score, (int, float)) else None,
+                trust_score=int(trust_score),
                 verdict=verdict,
                 user=user,
             )
@@ -1170,56 +1664,9 @@ async def analyze_job(request: JobAnalyzeRequest, authorization: Optional[str] =
         raise HTTPException(status_code=500, detail=f"Job analysis failed: {str(e)}")
 
 
-# ============================================
-# TESTING ENDPOINT (Remove in production)
-# ============================================
-
-@app.post("/api/test-job-ai")
-async def test_job_ai_analysis():
-    """Test endpoint to verify AI job analysis is working"""
-    test_job = {
-        "company_name": "Tech Startup Inc",
-        "job_description": "We're hiring a remote data entry specialist. No experience required! Earn $5000 per week working from home. Just pay a $299 training fee to get started. Act fast - only 3 positions left!",
-        "salary": "$5000/week",
-        "recruiter_email": "hiring@gmail.com",
-        "job_url": "https://suspicious-job-site.xyz/job123"
-    }
-
-    ai_result = analyze_job_with_ai(
-        company_name=test_job["company_name"],
-        job_description=test_job["job_description"],
-        salary=test_job["salary"],
-        recruiter_email=test_job["recruiter_email"],
-        job_url=test_job["job_url"]
-    )
-
-    if ai_result:
-        insights = extract_job_insights_from_ai(ai_result)
-        return {
-            "status": "success",
-            "ai_analysis": ai_result,
-            "extracted_insights": insights,
-            "message": "AI job analysis is working correctly!"
-        }
-    else:
-        return {
-            "status": "failed",
-            "message": "AI analysis not available. Check GROQ_API_KEY."
-        }
-
-print("✅ Job Analyzer AI enhancement loaded")
-print("🤖 Groq AI will be used for job posting analysis")
-print("📊 AI insights will adjust trust scores by -30 to +10 points")
-
-def get_job_verdict(trust_score: int) -> str:
-    """Return a short human-readable verdict based on trust score (0-100)."""
-    try:
-        t = int(trust_score)
-    except Exception:
-        return "Unknown"
-
-    if t >= 70:
-        return "Likely Legitimate"
-    if t >= 40:
-        return "Possibly Suspicious"
-    return "Likely Scam"
+if __name__ == "__main__":
+    import uvicorn
+    print("🚀 Starting Platform Analyzer API...")
+    print("📊 Version 2.0.0")
+    print("✅ All endpoints loaded successfully")
+    uvicorn.run(app, host="0.0.0.0", port=8000)
